@@ -1,0 +1,119 @@
+# 1nic-aligned: 1 GPU + 1 NIC on the same NUMA node.
+# gpu-0 (0008:06:00.0, NUMA 0) + any 1 RDMA VF from NUMA 0.
+# NCCL enables GDR via NCCL_NET_GDR_C2C=1 for NUMA-local NICs.
+# Transport: NET/IB/GDRDMA(PCI).
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1nic-aligned
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 1
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].sriov == false &&
+                device.attributes["dra.net"].numaNode == 0
+---
+# 1nic-unaligned: 1 GPU (NUMA 0) + 1 NIC (NUMA 1). Cross-NUMA, SYS affinity.
+# gpu-0 (0008:06:00.0, NUMA 0) + any 1 RDMA VF from NUMA 1.
+# GDR is disabled by NCCL; expect significantly lower bandwidth.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1nic-unaligned
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 1
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].sriov == false &&
+                device.attributes["dra.net"].numaNode == 1
+---
+# 2nic-aligned: 1 GPU + 2 NICs, all on NUMA 0.
+# gpu-0 (0008:06:00.0) + both RDMA VFs from NUMA 0 (rdma_vf_rail0, rdma_vf_rail1).
+# Doubles available RoCEv2 bandwidth vs 1nic-aligned. Saturates NUMA 0.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 2nic-aligned
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+          selectors:
+          - cel:
+              expression: 'device.attributes["resource.kubernetes.io"].pciBusID == "0008:06:00.0"'
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 2
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].sriov == false &&
+                device.attributes["dra.net"].numaNode == 0
+---
+# 4gpu-4nic: all 4 GPUs + all 4 RDMA VFs (both NUMA nodes).
+# Used with a ComputeDomain channel claim to enable NCCL_MNNVL_ENABLE=1.
+# Note: GB300.4 has 4 physical RDMA NICs (vs 8 on GB200), so total NIC
+# bandwidth per node is half that of GB200; busbw is dominated by the
+# NVLink fabric (MNNVL) at multinode scale.
+# See multinode-mpi-job.yaml and compute-domain.yaml for the full setup.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 4gpu-4nic
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 4
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 4
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                device.attributes["dra.net"].virtual == false &&
+                device.attributes["dra.net"].sriov == false

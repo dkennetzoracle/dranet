@@ -11,6 +11,7 @@ on Oracle Kubernetes Engine (OKE) with dranet.
 | [BM.GPU.H100.8](BM.GPU.H100.8/) | RoCEv2 (8x ConnectX-7, 100 Gb/s) | NUMA-aligned GPU + NIC allocation, NCCL all_reduce benchmark |
 | [BM.GPU.GB200-v3.4](BM.GPU.GB200-v3.4/) | RoCEv2 (8x ConnectX-8, 400 Gb/s) | NUMA-aligned GPU + NIC allocation, NCCL all_reduce benchmark, IPv6 GID |
 | [BM.GPU.GB200-v3.4 Placement Group](BM.GPU.GB200-v3.4/placement-group/) | RoCEv2 | OKE topology-aware scheduling using hpcIslandId / networkBlockId / localBlockId |
+| [BM.GPU.GB300.4](BM.GPU.GB300.4/) | RoCEv2 (4x ConnectX-8 PFs + 4x SR-IOV VFs, 400 Gb/s) | NUMA-aligned GPU + NIC (VF) allocation, NCCL all_reduce benchmark, IPv6 GID |
 
 ## Key dranet Features Demonstrated
 
