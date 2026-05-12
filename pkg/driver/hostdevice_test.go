@@ -28,6 +28,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"k8s.io/component-helpers/node/util/sysctl"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/internal/nlwrap"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -178,4 +179,200 @@ func Test_nhNetdev(t *testing.T) {
 		t.Fatalf("fail to attach netdev to namespace: %v", err)
 	}
 
+}
+
+// Test_nsAttachNetdev_IPv6_EnablesOnEACCES exercises the IPv6 EACCES retry
+// path in nsAttachNetdev. Container runtimes in single-stack IPv4 clusters
+// set net.ipv6.conf.all.disable_ipv6=1 in the pod ns, which causes
+// netlink.AddrAdd of an IPv6 GUA to return EACCES.
+//
+// Without the fix, nsAttachNetdev surfaces that EACCES and the pod sandbox
+// fails to come up. With the fix, dranet enables IPv6 in the pod ns and
+// retries once. This test reproduces that condition and asserts the IPv6
+// address ends up configured on the interface inside the pod ns and that
+// IPv6 is enabled there.
+func Test_nsAttachNetdev_IPv6_EnablesOnEACCES(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges.")
+	}
+	const ifName = "v6attach"
+	nsName, testNS, origns, cleanup := newTestNetns(t)
+	defer cleanup()
+
+	// Reproduce the single-stack-IPv4 pod ns: all.disable_ipv6=1.
+	if err := setSysctlInNs(testNS, origns, "net/ipv6/conf/all/disable_ipv6", 1); err != nil {
+		t.Fatalf("disable IPv6 in pod ns: %v", err)
+	}
+
+	createDummyLink(t, ifName)
+
+	cfg := apis.InterfaceConfig{
+		Name:      ifName,
+		Addresses: []string{"fd00:dead:beef::5/64"},
+	}
+	if _, err := nsAttachNetdev(ifName, path.Join("/run/netns", nsName), cfg); err != nil {
+		t.Fatalf("nsAttachNetdev: %v", err)
+	}
+
+	// Inside the pod ns: the address must be on the interface and IPv6
+	// must be enabled (both globally and per-interface). The address would
+	// not have been applied unless the retry path ran end-to-end.
+	assertInNs(t, testNS, origns, func(t *testing.T) {
+		assertAddrPresent(t, ifName, "fd00:dead:beef::5")
+		if v, err := sysctl.New().GetSysctl("net/ipv6/conf/all/disable_ipv6"); err != nil || v != 0 {
+			t.Errorf("after retry, all/disable_ipv6 = %d, err=%v; want 0", v, err)
+		}
+		if v, err := sysctl.New().GetSysctl("net/ipv6/conf/" + ifName + "/disable_ipv6"); err != nil || v != 0 {
+			t.Errorf("after retry, %s/disable_ipv6 = %d, err=%v; want 0", ifName, v, err)
+		}
+	})
+}
+
+// Test_nsAttachNetdev_IPv4_NoRetryNeeded ensures the EACCES retry branch is
+// gated on IPv6: an IPv4-only config must not exercise enableIPv6InNamespace
+// and must succeed even when IPv6 is disabled in the pod ns.
+func Test_nsAttachNetdev_IPv4_NoRetryNeeded(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges.")
+	}
+	const ifName = "v4attach"
+	nsName, testNS, origns, cleanup := newTestNetns(t)
+	defer cleanup()
+
+	// Disable IPv6 in the pod ns regardless — the IPv4 path must not be
+	// affected. We don't expect enableIPv6InNamespace to run here.
+	if err := setSysctlInNs(testNS, origns, "net/ipv6/conf/all/disable_ipv6", 1); err != nil {
+		t.Fatalf("disable IPv6 in pod ns: %v", err)
+	}
+
+	createDummyLink(t, ifName)
+
+	cfg := apis.InterfaceConfig{
+		Name:      ifName,
+		Addresses: []string{"192.168.42.5/24"},
+	}
+	if _, err := nsAttachNetdev(ifName, path.Join("/run/netns", nsName), cfg); err != nil {
+		t.Fatalf("nsAttachNetdev: %v", err)
+	}
+
+	assertInNs(t, testNS, origns, func(t *testing.T) {
+		assertAddrPresent(t, ifName, "192.168.42.5/24")
+		// IPv6 should remain disabled in the pod ns — the retry path
+		// should not have been triggered for an IPv4-only allocation.
+		if v, err := sysctl.New().GetSysctl("net/ipv6/conf/all/disable_ipv6"); err != nil || v != 1 {
+			t.Errorf("after IPv4-only path, all/disable_ipv6 = %d, err=%v; want 1 (retry must not run)", v, err)
+		}
+	})
+}
+
+// newTestNetns creates a named netns for use as the "pod ns", returning the
+// name (so callers can build /run/netns/<name>), the NsHandle for direct
+// switching, the original (host) ns, and a cleanup function the caller must
+// defer.
+func newTestNetns(t *testing.T) (string, netns.NsHandle, netns.NsHandle, func()) {
+	t.Helper()
+	origns, err := netns.Get()
+	if err != nil {
+		t.Fatalf("netns.Get(): %v", err)
+	}
+	rnd := make([]byte, 4)
+	if _, err := rand.Read(rnd); err != nil {
+		_ = origns.Close()
+		t.Fatalf("rand.Read: %v", err)
+	}
+	nsName := fmt.Sprintf("dranet-test-%x", rnd)
+	testNS, err := netns.NewNamed(nsName)
+	if err != nil {
+		_ = origns.Close()
+		t.Fatalf("netns.NewNamed: %v", err)
+	}
+	// NewNamed leaves us inside testNS; switch back to origns immediately.
+	if err := netns.Set(origns); err != nil {
+		_ = testNS.Close()
+		_ = netns.DeleteNamed(nsName)
+		_ = origns.Close()
+		t.Fatalf("netns.Set(origns): %v", err)
+	}
+	return nsName, testNS, origns, func() {
+		_ = netns.DeleteNamed(nsName)
+		_ = testNS.Close()
+		_ = origns.Close()
+	}
+}
+
+// createDummyLink adds a dummy interface in the current netns and brings it
+// up, registering a t.Cleanup that removes it if it is still in the current
+// netns when the test ends. We refetch the link by name after creation so
+// the returned Link carries a valid Index (LinkAdd does not populate the
+// caller-supplied struct).
+func createDummyLink(t *testing.T, name string) {
+	t.Helper()
+	if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}); err != nil {
+		t.Fatalf("LinkAdd(%s) in host ns: %v", name, err)
+	}
+	t.Cleanup(func() {
+		if l, err := nlwrap.LinkByName(name); err == nil {
+			_ = netlink.LinkDel(l)
+		}
+	})
+	link, err := nlwrap.LinkByName(name)
+	if err != nil {
+		t.Fatalf("LinkByName(%s): %v", name, err)
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		t.Fatalf("LinkSetUp(%s): %v", name, err)
+	}
+}
+
+// setSysctlInNs jumps into target, sets a sysctl, and returns to origin.
+// The OS thread is locked for the duration so the ns switch is safe.
+func setSysctlInNs(target, origin netns.NsHandle, key string, value int) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := netns.Set(target); err != nil {
+		return fmt.Errorf("netns.Set(target): %w", err)
+	}
+	defer func() { _ = netns.Set(origin) }()
+	if err := sysctl.New().SetSysctl(key, value); err != nil {
+		return fmt.Errorf("SetSysctl(%s=%d): %w", key, value, err)
+	}
+	return nil
+}
+
+// assertInNs runs the assertion closure inside target and returns to origin.
+// Wrapping the switch in its own function scope guarantees the OS-thread
+// lock and netns switch unwind cleanly even if the closure t.Fatal's.
+func assertInNs(t *testing.T, target, origin netns.NsHandle, fn func(t *testing.T)) {
+	t.Helper()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := netns.Set(target); err != nil {
+		t.Fatalf("netns.Set(target): %v", err)
+	}
+	defer func() {
+		if err := netns.Set(origin); err != nil {
+			t.Fatalf("netns.Set(origin): %v", err)
+		}
+	}()
+	fn(t)
+}
+
+// assertAddrPresent verifies via netlink that the given CIDR or IP literal
+// appears in the address list of ifName in the *current* netns.
+func assertAddrPresent(t *testing.T, ifName, addr string) {
+	t.Helper()
+	link, err := nlwrap.LinkByName(ifName)
+	if err != nil {
+		t.Fatalf("LinkByName(%s) in pod ns: %v", ifName, err)
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		t.Fatalf("AddrList(%s): %v", ifName, err)
+	}
+	for _, a := range addrs {
+		if a.IPNet != nil && (a.IPNet.String() == addr || strings.HasPrefix(a.IPNet.String(), strings.SplitN(addr, "/", 2)[0]+"/")) {
+			return
+		}
+	}
+	t.Errorf("address %q not present on %s in pod ns; have: %v", addr, ifName, addrs)
 }
