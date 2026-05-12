@@ -150,7 +150,21 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		}
 		err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})
 		if err != nil {
-			return nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPAth, err)
+			// In single-stack IPv4 clusters, container runtimes set
+			// net.ipv6.conf.all.disable_ipv6=1 in the pod ns, so adding an
+			// IPv6 address returns EACCES. Enable IPv6 for this iface in the
+			// pod ns and retry once before failing — this is required on
+			// OKE GPU shapes where the RDMA NICs carry a routable IPv6 GUA.
+			if ip.To4() == nil && errors.Is(err, unix.EACCES) {
+				klog.V(2).Infof("IPv6 disabled in pod ns %s; enabling for %s and retrying %s", containerNsPAth, nsLink.Attrs().Name, address)
+				if enableErr := enableIPv6InNamespace(containerNsPAth, nsLink.Attrs().Name); enableErr != nil {
+					return nil, fmt.Errorf("failed to set up address %s on namespace %s (and failed to enable IPv6: %v): %w", address, containerNsPAth, enableErr, err)
+				}
+				err = nhNs.AddrAdd(nsLink, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}})
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to set up address %s on namespace %s: %w", address, containerNsPAth, err)
+			}
 		}
 		networkData.IPs = append(networkData.IPs, address)
 	}

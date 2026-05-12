@@ -187,6 +187,46 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 	return errors.Join(errorList...)
 }
 
+// enableIPv6InNamespace enables IPv6 in the pod's network namespace for a
+// specific interface (and globally as well, since the per-interface knob is
+// OR'd with net.ipv6.conf.all.disable_ipv6 by the kernel). Container runtimes
+// in single-stack IPv4 clusters set net.ipv6.conf.all.disable_ipv6=1 in the
+// pod namespace, which causes AddrAdd of an IPv6 address to fail with EACCES.
+// This helper makes IPv6 usable on the specific interface so dranet can apply
+// the routable IPv6 GUA carried over from the host.
+func enableIPv6InNamespace(containerNsPath, ifName string) error {
+	origns, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("unexpected error trying to get namespace: %v", err)
+	}
+	defer origns.Close() // nolint:errcheck
+
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return fmt.Errorf("could not get network namespace from path %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := netns.Set(containerNs); err != nil {
+		return fmt.Errorf("failed to join network namespace %s: %v", containerNsPath, err)
+	}
+	defer netns.Set(origns) // nolint:errcheck
+
+	sysctlInterface := sysctl.New()
+	// net.ipv6.conf.all.disable_ipv6 must be 0 for any interface to accept
+	// IPv6 addresses, regardless of per-interface settings.
+	if err := sysctlInterface.SetSysctl("net/ipv6/conf/all/disable_ipv6", 0); err != nil {
+		return fmt.Errorf("failed to enable IPv6 in pod ns: %w", err)
+	}
+	ifSysctl := fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", ifName)
+	if err := sysctlInterface.SetSysctl(ifSysctl, 0); err != nil {
+		return fmt.Errorf("failed to set %s: %w", ifSysctl, err)
+	}
+	return nil
+}
+
 // applyInterfaceForwarding enables IPv4 and IPv6 forwarding for a specific interface.
 // It uses the Kubernetes sysctl helper while locked into the pod's network namespace.
 func applyInterfaceForwarding(containerNsPath string, ifName string, enable bool) error {
