@@ -332,6 +332,17 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 		return fmt.Errorf("failed to apply neighbor configuration for interface %s in namespace %s: %w", ifNameInNs, ns, err)
 	}
 
+	// For a RoCE interface (a netdev backed by an RDMA device), replicate the host's
+	// multi-homed ARP-flux-prevention sysctls. Multi-rail RDMA pods get several NICs
+	// on one IP subnet; without these, ARP flux makes peers resolve a rail's IP on
+	// the wrong NIC and RDMA collectives cross rails and fail. See applyInterfaceRdmaARP.
+	if config.RDMADevice.LinkDev != "" {
+		if err := applyInterfaceRdmaARP(ns, ifNameInNs); err != nil {
+			logger.Error(err, "RunPodSandbox failed to apply RDMA ARP sysctls", "podInterface", ifNameInNs)
+			return fmt.Errorf("failed to apply RDMA ARP sysctls for interface %s in namespace %s: %w", ifNameInNs, ns, err)
+		}
+	}
+
 	resourceClaimStatusDevice.WithConditions(
 		metav1apply.Condition().
 			WithType("NetworkReady").

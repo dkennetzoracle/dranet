@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"sort"
 	"strings"
@@ -47,6 +48,14 @@ import (
 
 const (
 	rdmaCmPath = "/dev/infiniband/rdma_cm"
+
+	// railRouteTableBase offsets the per-rail policy-routing tables so they do not
+	// collide with the reserved tables (0/253/254/255); the host interface index is
+	// added to give each moved RDMA NIC a unique table within the pod.
+	railRouteTableBase = 1000
+	// railRulePriority is the ip-rule priority for the per-rail source rules: below
+	// the main table (32766) so they take effect, above the local table.
+	railRulePriority = 100
 )
 
 // DRA hooks exposes Network Devices to Kubernetes, the Network devices and its attributes are
@@ -443,6 +452,35 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		if rdmaDev, err := inventory.GetRdmaDevice(ifName); err == nil && rdmaDev != "" {
 			klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
 			deviceCfg.RDMADevice = buildRDMAConfig(rdmaDev, charDevices)
+		}
+
+		// Multi-rail RoCE source steering. When several RDMA NICs share one IP subnet
+		// (rail0..railN all in e.g. 10.224.0.0/12), the main-table route the host
+		// advertises is a single overlapping prefix per NIC, so the kernel's route
+		// lookup for a QP's neighbor/ARP resolution may pick the wrong NIC and the QP
+		// cannot reach its same-rail peer (ibv_modify_qp INIT->RTR times out). Give each
+		// NIC its own routing table holding its subnet route(s), and a source rule
+		// sending traffic FROM that NIC's address to it, so traffic sourced from a rail
+		// leaves that rail's NIC. RoCE (netdev + RDMA) interfaces only, and not with VRF
+		// (which handles table lookup itself). Runs after RDMADevice is populated above.
+		if deviceCfg.RDMADevice.LinkDev != "" && len(routes) > 0 && deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
+			railTable := railRouteTableBase + link.Attrs().Index
+			for _, addr := range deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses {
+				ip, _, perr := net.ParseCIDR(addr)
+				if perr != nil || ip.To4() == nil {
+					continue // IPv4 rails only; RoCE here is v2/IPv4
+				}
+				for _, r := range routes {
+					railRoute := r
+					railRoute.Table = railTable
+					deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, railRoute)
+				}
+				deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, apis.RuleConfig{
+					Priority: railRulePriority,
+					Source:   ip.String() + "/32",
+					Table:    railTable,
+				})
+			}
 		}
 
 		// Remove the pinned programs before the NRI hooks since it

@@ -182,6 +182,16 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		return nil, fmt.Errorf("failed to create plugin path %s: %v", driverPluginPath, err)
 	}
 
+	// Ensure the registrar directory exists. When RegistrarDirectoryPath is set
+	// explicitly (to honor a non-default kubelet --root-dir), the kubeletplugin
+	// library does not create it for us the way it does for its built-in default,
+	// so the registration socket bind fails with ENOENT if the path is not already
+	// present (e.g. a hostPath mount of a directory the node has not created yet).
+	registrarPath := filepath.Join(plugin.kubeletRootDir, "plugins_registry")
+	if err = os.MkdirAll(registrarPath, 0750); err != nil {
+		return nil, fmt.Errorf("failed to create registrar path %s: %v", registrarPath, err)
+	}
+
 	// Derive the registration and plugin data directories from the kubelet root
 	// dir so they are correct when the kubelet uses a non-default --root-dir. At
 	// the default this matches the kubeletplugin defaults, so existing deployments
@@ -190,7 +200,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		kubeletplugin.DriverName(driverName),
 		kubeletplugin.NodeName(nodeName),
 		kubeletplugin.KubeClient(kubeClient),
-		kubeletplugin.RegistrarDirectoryPath(filepath.Join(plugin.kubeletRootDir, "plugins_registry")),
+		kubeletplugin.RegistrarDirectoryPath(registrarPath),
 		kubeletplugin.PluginDataDirectoryPath(driverPluginPath),
 	}
 	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)

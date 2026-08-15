@@ -238,6 +238,61 @@ func applyInterfaceForwarding(containerNsPath string, ifName string, enable bool
 	return errors.Join(errorList...)
 }
 
+// applyInterfaceRdmaARP replicates the per-interface ARP-flux-prevention sysctls
+// that a multi-homed RoCE host uses, so a pod that receives several RDMA NICs on
+// the same IP subnet (multi-rail: rdma0..rdmaN) behaves like the host. Without
+// these, the kernel answers/announces ARP for any local address on any interface,
+// so a peer resolves a rail's IP on the wrong NIC (ARP flux) and RDMA traffic
+// crosses rails and fails (RETRY_EXC). Values match the host RDMA-NIC config:
+//
+//	arp_ignore=1    only answer ARP if the target IP is on the receiving interface
+//	arp_announce=2  announce the best source address for the target subnet
+//	arp_filter=1    let each NIC answer ARP only for addresses it would route
+//	rp_filter=0     disable reverse-path filtering (asymmetric multi-rail paths)
+//
+// Uses the Kubernetes sysctl helper while locked into the pod's network namespace,
+// mirroring applyInterfaceForwarding. IPv6 has no equivalent (ND, not ARP).
+func applyInterfaceRdmaARP(containerNsPath string, ifName string) error {
+	origns, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("unexpected error trying to get namespace: %v", err)
+	}
+	defer origns.Close() // nolint:errcheck
+
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return fmt.Errorf("could not get network namespace from path %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	// Lock the OS thread and switch into the container's network namespace.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := netns.Set(containerNs); err != nil {
+		return fmt.Errorf("failed to join network namespace %s: %v", containerNsPath, err)
+	}
+	defer netns.Set(origns) // nolint:errcheck
+
+	sysctlInterface := sysctl.New()
+	var errorList []error
+	arpSysctls := []struct {
+		name  string
+		value int
+	}{
+		{"arp_ignore", 1},
+		{"arp_announce", 2},
+		{"arp_filter", 1},
+		{"rp_filter", 0},
+	}
+	for _, s := range arpSysctls {
+		key := fmt.Sprintf("net/ipv4/conf/%s/%s", ifName, s.name)
+		if err := sysctlInterface.SetSysctl(key, s.value); err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to set %s=%d: %w", key, s.value, err))
+		}
+	}
+	return errors.Join(errorList...)
+}
+
 func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFConfig) (int, error) {
 	if vrfConfig == nil {
 		return 0, fmt.Errorf("vrf config is nil")
