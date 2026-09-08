@@ -369,6 +369,51 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
+			name:      "valid acceptRA",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "valid acceptRA at range bounds",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "invalid acceptRA (too large)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](3)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid acceptRA (negative)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](-1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "valid acceptRA (1)",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "acceptRA with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "acceptRA with mtu at the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", AcceptRA: ptr.To[int32](2), MTU: ptr.To[int32](1280)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",
@@ -542,6 +587,13 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
+			name:      "acceptRA is rejected",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
 			name:      "addressing dhcp is rejected",
 			cfg:       &InterfaceConfig{Type: "IPVLAN", Addressing: AddressingModeDHCP},
 			fieldPath: "iface",
@@ -590,6 +642,11 @@ func TestValidateRDMAOnlyConfigRejectsARPSettings(t *testing.T) {
 		{
 			name:      "arpAnnounce is rejected",
 			raw:       `{"interface":{"arpAnnounce":2}}`,
+			expectErr: true,
+		},
+		{
+			name:      "acceptRA is rejected",
+			raw:       `{"interface":{"acceptRA":2}}`,
 			expectErr: true,
 		},
 		{
