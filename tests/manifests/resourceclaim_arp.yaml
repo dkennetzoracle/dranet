@@ -33,6 +33,7 @@ spec:
             name: dranet-arp
             arpIgnore: 1
             arpAnnounce: 2
+            acceptRA: 2
 ---
 apiVersion: v1
 kind: Pod

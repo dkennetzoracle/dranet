@@ -186,6 +186,10 @@ wait_for_ready_pods() {
   run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv4/conf/dranet-arp/arp_announce
   assert_success
   assert_output "2"
+
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/accept_ra
+  assert_success
+  assert_output "2"
 }
 
 @test "dummy interface with IP addresses ResourceClaimTemplate" {
