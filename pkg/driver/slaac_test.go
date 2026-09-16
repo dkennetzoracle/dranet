@@ -44,10 +44,10 @@ func TestReadinessBudget(t *testing.T) {
 	)
 
 	tests := []struct {
-		name      string
-		deadline  time.Duration // 0 means no deadline
-		want      time.Duration
-		expectErr bool
+		name         string
+		deadline     time.Duration // 0 means no deadline
+		want         time.Duration
+		wantExceeded bool
 	}{
 		{
 			name: "no deadline falls back to the maximum",
@@ -64,14 +64,19 @@ func TestReadinessBudget(t *testing.T) {
 			want:     400 * time.Millisecond,
 		},
 		{
-			name:      "a deadline inside the reserve leaves no time to wait",
-			deadline:  300 * time.Millisecond,
-			expectErr: true,
+			// Nothing is left to protect with a rollback once the runtime has
+			// stopped waiting for the request, so the caller gets the full
+			// budget and a heads-up instead of being told to give up.
+			name:         "a deadline inside the reserve is treated as exceeded",
+			deadline:     300 * time.Millisecond,
+			want:         max,
+			wantExceeded: true,
 		},
 		{
-			name:      "an expired deadline leaves no time to wait",
-			deadline:  -time.Second,
-			expectErr: true,
+			name:         "an expired deadline is treated as exceeded",
+			deadline:     -time.Second,
+			want:         max,
+			wantExceeded: true,
 		},
 	}
 	for _, tt := range tests {
@@ -83,15 +88,9 @@ func TestReadinessBudget(t *testing.T) {
 				defer cancel()
 			}
 
-			got, err := readinessBudget(ctx, max, reserve)
-			if tt.expectErr {
-				if err == nil {
-					t.Fatalf("readinessBudget() = %v, want an error", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("readinessBudget() error: %v", err)
+			got, exceeded := readinessBudget(ctx, max, reserve)
+			if exceeded != tt.wantExceeded {
+				t.Errorf("readinessBudget() deadlineExceeded = %v, want %v", exceeded, tt.wantExceeded)
 			}
 			// time.Until loses a little to the clock between the two calls.
 			if diff := tt.want - got; diff < 0 || diff > 50*time.Millisecond {
@@ -340,9 +339,10 @@ func TestAwaitSLAACReadyRollsBack(t *testing.T) {
 	}
 }
 
-// TestAwaitSLAACReadyNoBudget checks that a request that is already out of time
-// skips the wait and still rolls the interface back.
-func TestAwaitSLAACReadyNoBudget(t *testing.T) {
+// TestAwaitSLAACReadyPastDeadline checks that a request whose deadline has
+// already passed still finishes the wait, instead of taking the interface back
+// from a Pod the runtime is going to start anyway.
+func TestAwaitSLAACReadyPastDeadline(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("Test requires root privileges.")
 	}
@@ -366,19 +366,44 @@ func TestAwaitSLAACReadyNoBudget(t *testing.T) {
 		t.Fatalf("nsAttachNetdev() error: %v", err)
 	}
 
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		t.Fatalf("failed to open the container namespace: %v", err)
+	}
+	defer containerNs.Close()
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		t.Fatalf("failed to open a netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+	link, err := nhNs.LinkByName(ifNameInNs)
+	if err != nil {
+		t.Fatalf("failed to get link %s: %v", ifNameInNs, err)
+	}
+
+	// The address turns up after the deadline has already passed.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = nhNs.AddrAdd(link, &netlink.Addr{
+			IPNet:       &net.IPNet{IP: net.ParseIP("2001:db8::2"), Mask: net.CIDRMask(64, 128)},
+			ValidLft:    3600,
+			PreferedLft: 1800,
+			Flags:       unix.IFA_F_NODAD,
+		})
+	}()
+
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Millisecond))
 	defer cancel()
 
-	start := time.Now()
-	_, err := awaitSLAACReady(ctx, containerNsPath, ifNameInNs, hostIfName, time.Second)
-	if err == nil {
-		t.Fatal("awaitSLAACReady() succeeded without any time to wait, want an error")
+	addresses, err := awaitSLAACReady(ctx, containerNsPath, ifNameInNs, hostIfName, time.Second)
+	if err != nil {
+		t.Fatalf("awaitSLAACReady() gave up after the deadline passed: %v", err)
 	}
-	// Nothing should have been waited on: the reserve is for the rollback.
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Errorf("awaitSLAACReady() took %v, want it to skip the wait entirely", elapsed)
+	if diff := cmp.Diff([]string{"2001:db8::2/64"}, addresses); diff != "" {
+		t.Errorf("awaitSLAACReady() addresses mismatch (-want +got):\n%s", diff)
 	}
-	if _, err := nlwrap.LinkByName(hostIfName); err != nil {
-		t.Fatalf("interface %s was not rolled back to the host: %v", hostIfName, err)
+	// The interface must stay in the Pod namespace, not be rolled back.
+	if _, err := nlwrap.LinkByName(hostIfName); err == nil {
+		t.Errorf("interface %s was rolled back to the host even though autoconfiguration succeeded", hostIfName)
 	}
 }

@@ -39,6 +39,7 @@ spec:
               expression: >-
                 device.attributes["dra.net"].rdma == true &&
                 device.attributes["dra.net"].virtual == false &&
+                has(device.attributes["dra.net"].ifName) &&
                 device.attributes["dra.net"].ifName.startsWith("rdma_p0_rail")
       config:
       - requests: ["nic"]
@@ -69,6 +70,7 @@ spec:
               expression: >-
                 device.attributes["dra.net"].rdma == true &&
                 device.attributes["dra.net"].virtual == false &&
+                has(device.attributes["dra.net"].ifName) &&
                 device.attributes["dra.net"].ifName == "rdma_p0_rail0"
       config:
       - requests: ["nic"]

@@ -51,23 +51,29 @@ const (
 )
 
 // readinessBudget returns how long a readiness check may wait, given the
-// deadline of the request that triggered it. It reserves `reserve` for the
-// rollback that a failed check has to perform, and never waits longer than
-// `max`.
+// deadline of the request that triggered it, and whether that deadline has
+// already passed. It reserves `reserve` for the rollback that a failed check has
+// to perform, and never waits longer than `max`.
 //
 // A context without a deadline falls back to `max`: the container runtime
 // enforces its own timeout on the plugin request whether or not it propagates a
 // deadline to us, so an unbounded wait is never correct.
-func readinessBudget(ctx context.Context, max, reserve time.Duration) (time.Duration, error) {
+//
+// Once the deadline has passed the reserve has nothing left to protect. The
+// runtime has stopped waiting for this request, so it will not act on an error
+// and the Pod starts either way; rolling the interface back at that point only
+// takes a NIC away from a Pod that is starting regardless. The second return
+// value says so, and the caller waits on `max` instead.
+func readinessBudget(ctx context.Context, max, reserve time.Duration) (budget time.Duration, deadlineExceeded bool) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return max, nil
+		return max, false
 	}
-	budget := time.Until(deadline) - reserve
-	if budget <= 0 {
-		return 0, fmt.Errorf("no time left to wait: %v until the request deadline, which is within the %v reserved for rollback", time.Until(deadline).Round(time.Millisecond), reserve)
+	remaining := time.Until(deadline) - reserve
+	if remaining <= 0 {
+		return max, true
 	}
-	return min(budget, max), nil
+	return min(remaining, max), false
 }
 
 // waitForSLAAC blocks until ifName holds an autoconfigured global unicast IPv6
@@ -188,13 +194,22 @@ func awaitSLAACReady(ctx context.Context, containerNsPath, ifNameInNs, hostIfNam
 	}
 	defer containerNs.Close()
 
-	budget, err := readinessBudget(ctx, timeout, slaacRollbackReserve)
+	budget, deadlineExceeded := readinessBudget(ctx, timeout, slaacRollbackReserve)
+	waitCtx := ctx
+	if deadlineExceeded {
+		// Detach from the expired deadline, keeping the logger and the rest of
+		// the context values. Attaching devices one at a time can outrun the
+		// runtime's timeout on its own; the wait itself takes milliseconds, so
+		// finishing it gives the Pod a usable interface where giving up would
+		// only hand it a missing one.
+		klog.FromContext(ctx).Info("Request deadline passed before IPv6 autoconfiguration; waiting anyway rather than taking the interface back",
+			"interface", ifNameInNs, "budget", budget)
+		waitCtx = context.WithoutCancel(ctx)
+	}
+
+	addresses, err := waitForSLAAC(waitCtx, containerNs, ifNameInNs, budget)
 	if err == nil {
-		var addresses []string
-		addresses, err = waitForSLAAC(ctx, containerNs, ifNameInNs, budget)
-		if err == nil {
-			return addresses, nil
-		}
+		return addresses, nil
 	}
 
 	if rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPath, ifNameInNs, hostIfName); rollbackErr != nil {

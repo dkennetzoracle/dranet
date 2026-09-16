@@ -183,8 +183,14 @@ The wait is bounded by `--slaac-ready-timeout` (1.5s by default) and by the dead
 the runtime request that triggered it, minus a reserve for rollback. If no address
 arrives in time, DRANET moves the interface back to the host under its original name and
 fails the sandbox, so the kubelet retries rather than starting a workload on an interface
-with no source address. Raising `--slaac-ready-timeout` past the runtime's own timeout for
-a plugin request (2s in both containerd and CRI-O) has no effect.
+with no source address.
+
+If that deadline has already passed before the wait starts — attaching several NICs one at
+a time can outrun the runtime's timeout for a plugin request, 2s in both containerd and
+CRI-O — DRANET logs a warning and finishes the wait on `--slaac-ready-timeout` instead. At
+that point the runtime is no longer waiting for the request: it will not act on an error
+and the Pod starts either way, so taking the interface back would only leave the Pod
+without a NIC it is about to use. A rollback still happens if the wait itself fails.
 
 `SLAAC` requires a passthrough interface: subinterface types such as IPVLAN do not get
 per-interface sysctls, and it cannot be combined with `addresses` or with `acceptRA: 0`.
