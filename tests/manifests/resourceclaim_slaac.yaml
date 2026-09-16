@@ -15,39 +15,35 @@
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
-  name: dummy-interface-arp
+  name: dummy-interface-slaac
 spec:
   devices:
     requests:
-    - name: req-dummy-arp
+    - name: req-dummy-slaac
       exactly:
         deviceClassName: dra.net
         selectors:
         - cel:
-            expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "dummy0"
+            expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "dummy1"
     config:
     - opaque:
         driver: dra.net
         parameters:
           interface:
-            name: dranet-arp
-            arpIgnore: 1
-            arpAnnounce: 2
-            acceptRA: 2
-            dadTransmits: 0
-            routerSolicitationDelay: 0
+            name: dranet-slaac
+            addressing: SLAAC
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: pod-arp-test
+  name: pod-slaac-test
   labels:
-    app: arp
+    app: slaac
 spec:
   containers:
-  - name: agnhost-arp
+  - name: agnhost-slaac
     image: registry.k8s.io/e2e-test-images/agnhost:2.54
     command: ["sleep", "infinity"]
   resourceClaims:
-  - name: arp-net
-    resourceClaimName: dummy-interface-arp
+  - name: slaac-net
+    resourceClaimName: dummy-interface-slaac

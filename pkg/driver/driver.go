@@ -85,6 +85,16 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
+// WithSLAACReadyTimeout bounds how long the driver waits for an interface to
+// pick up an address from IPv6 router advertisements before rolling it back out
+// of the Pod namespace. It is capped by the deadline of the runtime request that
+// triggered the wait.
+func WithSLAACReadyTimeout(timeout time.Duration) Option {
+	return func(o *NetworkDriver) {
+		o.slaacReadyTimeout = timeout
+	}
+}
+
 // WithKubeletRootDir sets the kubelet data directory (its --root-dir). The
 // driver's registration socket lives under <dir>/plugins_registry and its
 // dra.sock under <dir>/plugins. Set this when the kubelet runs with a
@@ -114,6 +124,10 @@ type NetworkDriver struct {
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
 	kubeletRootDir string
+
+	// slaacReadyTimeout bounds the wait for IPv6 autoconfiguration to complete
+	// inside a Pod namespace.
+	slaacReadyTimeout time.Duration
 
 	clock clock.WithTicker // Injectable clock for testing
 }
@@ -148,6 +162,10 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 
 	for _, o := range opts {
 		o(plugin)
+	}
+
+	if plugin.slaacReadyTimeout <= 0 {
+		plugin.slaacReadyTimeout = DefaultSLAACReadyTimeout
 	}
 
 	driverPluginPath := filepath.Join(plugin.kubeletRootDir, "plugins", driverName)

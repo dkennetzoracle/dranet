@@ -19,9 +19,12 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
+
+	"sigs.k8s.io/dranet/pkg/apis"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -182,7 +185,7 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 					return err
 				}
-			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice, np.slaacReadyTimeout); err != nil {
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
 					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 				return err
@@ -260,7 +263,7 @@ func attachRdmaToNS(ctx context.Context, linkDev, ns string, resourceClaimStatus
 // attachNetdevToNS moves the host network interface into the pod network namespace,
 // applies all associated configuration (ethtool, eBPF, routes, rules, neighbors),
 // and records the resulting status conditions on resourceClaimStatusDevice.
-func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration, slaacReadyTimeout time.Duration) error {
 	ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger := klog.LoggerWithValues(klog.FromContext(ctx), "device", deviceName, "interface", ifName, "netns", ns)
 	logger.V(2).Info("RunPodSandbox processing Network device")
@@ -270,6 +273,27 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
+	}
+
+	// The interface is up in the Pod but not yet usable: with SLAAC its address
+	// arrives from a router advertisement some milliseconds later. Wait for it
+	// here, while there is still a namespace to roll back out of, rather than
+	// letting the workload start and fail on a NIC with no source address.
+	if config.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC {
+		addresses, err := awaitSLAACReady(ctx, ns, networkData.InterfaceName, ifName, slaacReadyTimeout)
+		if err != nil {
+			logger.Error(err, "RunPodSandbox interface did not complete IPv6 autoconfiguration")
+			return fmt.Errorf("error waiting for IPv6 autoconfiguration of device %s in namespace %s: %w", deviceName, ns, err)
+		}
+		networkData.IPs = append(networkData.IPs, addresses...)
+		resourceClaimStatusDevice.WithConditions(
+			metav1apply.Condition().
+				WithType("SLAACReady").
+				WithStatus(metav1.ConditionTrue).
+				WithReason("SLAACReady").
+				WithMessage(fmt.Sprintf("autoconfigured addresses: %s", strings.Join(addresses, ","))).
+				WithLastTransitionTime(metav1.Now()),
+		)
 	}
 
 	resourceClaimStatusDevice.WithConditions(

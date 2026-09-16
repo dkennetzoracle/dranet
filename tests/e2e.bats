@@ -190,6 +190,42 @@ wait_for_ready_pods() {
   run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/accept_ra
   assert_success
   assert_output "2"
+
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/dad_transmits
+  assert_success
+  assert_output "0"
+
+  run kubectl exec pod-arp-test -- cat /proc/sys/net/ipv6/conf/dranet-arp/router_solicitation_delay
+  assert_success
+  assert_output "0"
+}
+
+# Nothing sends router advertisements on a dummy interface, so this exercises the
+# other half of SLAAC: the readiness wait gives up within its budget and the
+# interface goes back to the host instead of staying in a namespace that is about
+# to be torn down.
+@test "SLAAC addressing rolls the interface back when no advertisement arrives" {
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link add dummy1 type dummy"
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link set up dev dummy1"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_slaac.yaml
+
+  # The sandbox must fail rather than start the workload without an address.
+  run kubectl wait --for=condition=ready pod/pod-slaac-test --timeout=30s
+  assert_failure
+
+  # The interface is back on the host, under its original name and up, so the
+  # kubelet's next attempt starts from the same state as the first.
+  run docker exec "$CLUSTER_NAME"-worker bash -c "ip link show dummy1"
+  assert_success
+  assert_output --partial "UP"
+
+  run docker exec "$CLUSTER_NAME"-worker bash -c "ip link show dranet-slaac"
+  assert_failure
+
+  kubectl delete -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_slaac.yaml --ignore-not-found
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link del dummy1" || true
 }
 
 @test "dummy interface with IP addresses ResourceClaimTemplate" {

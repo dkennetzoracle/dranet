@@ -69,7 +69,8 @@ var (
 	webhookURL        string
 	featureGates      string
 
-	kubeletRootDir string
+	kubeletRootDir    string
+	slaacReadyTimeout time.Duration
 
 	ready atomic.Bool
 )
@@ -88,6 +89,7 @@ func init() {
 	flag.StringVar(&profileProvider, "profile-provider", "cloud", "Provides user intent (cloud, webhook, none). 'cloud' falls back to the cloud-provider's native implementation.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
+	flag.DurationVar(&slaacReadyTimeout, "slaac-ready-timeout", driver.DefaultSLAACReadyTimeout, "How long to wait for an interface using 'addressing: SLAAC' to pick up an address from IPv6 router advertisements inside the Pod, before moving it back to the host and failing the sandbox. Capped by the container runtime's deadline for the request, minus a reserve for the rollback, so raising it past the runtime's plugin request timeout (2s by default) has no effect.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 
 	flag.Usage = func() {
@@ -175,6 +177,7 @@ func main() {
 	defer store.Close()
 
 	opts = append(opts, driver.WithKubeletRootDir(kubeletRootDir))
+	opts = append(opts, driver.WithSLAACReadyTimeout(slaacReadyTimeout))
 
 	if celExpression != "" {
 		env, err := cel.NewEnv(

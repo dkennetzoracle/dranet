@@ -78,6 +78,16 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			want:            true,
 		},
 		{
+			name:            "dad transmits only",
+			interfaceConfig: apis.InterfaceConfig{DADTransmits: ptr.To[int32](0)},
+			want:            true,
+		},
+		{
+			name:            "router solicitation delay only",
+			interfaceConfig: apis.InterfaceConfig{RouterSolicitationDelay: ptr.To[int32](0)},
+			want:            true,
+		},
+		{
 			name:            "zero values are still requested",
 			interfaceConfig: apis.InterfaceConfig{ARPIgnore: ptr.To[int32](0), ARPAnnounce: ptr.To[int32](0)},
 			want:            true,
@@ -101,14 +111,31 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 		{
 			name: "all settings",
 			interfaceConfig: apis.InterfaceConfig{
-				ARPIgnore:   ptr.To[int32](1),
-				ARPAnnounce: ptr.To[int32](2),
-				AcceptRA:    ptr.To[int32](2),
+				ARPIgnore:               ptr.To[int32](1),
+				ARPAnnounce:             ptr.To[int32](2),
+				AcceptRA:                ptr.To[int32](2),
+				DADTransmits:            ptr.To[int32](0),
+				RouterSolicitationDelay: ptr.To[int32](0),
 			},
 			want: map[string]int{
-				"net/ipv4/conf/rdma0/arp_ignore":   1,
-				"net/ipv4/conf/rdma0/arp_announce": 2,
-				"net/ipv6/conf/rdma0/accept_ra":    2,
+				"net/ipv4/conf/rdma0/arp_ignore":                1,
+				"net/ipv4/conf/rdma0/arp_announce":              2,
+				"net/ipv6/conf/rdma0/accept_ra":                 2,
+				"net/ipv6/conf/rdma0/dad_transmits":             0,
+				"net/ipv6/conf/rdma0/router_solicitation_delay": 0,
+			},
+		},
+		{
+			name: "the settings SLAAC defaults to",
+			interfaceConfig: apis.InterfaceConfig{
+				AcceptRA:                ptr.To[int32](2),
+				DADTransmits:            ptr.To[int32](0),
+				RouterSolicitationDelay: ptr.To[int32](0),
+			},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/accept_ra":                 2,
+				"net/ipv6/conf/rdma0/dad_transmits":             0,
+				"net/ipv6/conf/rdma0/router_solicitation_delay": 0,
 			},
 		},
 		{
