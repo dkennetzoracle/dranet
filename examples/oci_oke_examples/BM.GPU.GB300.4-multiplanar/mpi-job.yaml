@@ -22,6 +22,14 @@ spec:
       replicas: 1
       template:
         spec:
+          # The launcher only runs mpirun, but the image is arm64 and the GPU
+          # nodes carry a NoSchedule taint, so it needs both to land on one.
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
           containers:
           - name: nccl
             image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
