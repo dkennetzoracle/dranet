@@ -1,0 +1,55 @@
+# 4rail-ipvlan: an IPVLAN child on plane 0 of each rail.
+#
+# The passthrough variant in resource-claim-template.yaml moves the rail PF into
+# the Pod. This one leaves the PF on the host and gives the Pod an IPVLAN child
+# of it instead, which on this shape is dramatically cheaper and safer:
+#
+#   RunPodSandbox for 4 NICs   passthrough 4.4-5.7s   ipvlan 2.3ms
+#   PF after the Pod exits     DOWN, unaddressed      UP, still addressed
+#   Pods per rail              1                      many
+#
+# The 2.3ms matters because the container runtime allows a plugin roughly 2s per
+# RunPodSandbox; moving four ConnectX-8 PFs does not fit in that, an IPVLAN child
+# does not come close to it.
+#
+# REQUIRES the RDMA subsystem in shared netns mode on every node that serves this
+# claim: DraNet rejects a subinterface claim on an RDMA device in exclusive mode,
+# and the kernel only exposes the child's GIDs inside the Pod namespace in shared
+# mode. See the README for how to set it, and what it costs.
+#
+# Addressing is Unnumbered: the driver configures no addresses, and each child
+# autoconfigures from its rail's Router Advertisement. An IPVLAN child shares its
+# parent's MAC but the kernel still gives it a distinct interface identifier, so
+# children do not collide with the parent or with each other:
+#
+#   rdma_p0_rail0 (PF, host)  fdcd:8200:cde5:20b7:0a20:e7ff:fe96:0708
+#   child in pod A            fdcd:8200:cde5:20b7:0820:e700:0196:0708
+#
+# `addressing: SLAAC` would be the honest way to express this and would add the
+# readiness wait, but it needs the per-interface sysctls applied on the
+# subinterface path first (kubernetes-sigs/dranet#326). See the README.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 4rail-ipvlan
+spec:
+  spec:
+    devices:
+      requests:
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 4
+          selectors:
+          - cel:
+              expression: >-
+                has(device.attributes["dra.net"].ifName) &&
+                device.attributes["dra.net"].ifName.startsWith("rdma_p0_rail")
+      config:
+      - requests: ["nic"]
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              type: IPVLAN
+              addressing: Unnumbered
