@@ -84,6 +84,16 @@ type InterfaceConfig struct {
 	// Moving the interface resets it to the destination namespace default, so it
 	// must be requested explicitly.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
+
+	// DADTransmits controls how many Duplicate Address Detection probes the
+	// interface sends for a new IPv6 address through
+	// /proc/sys/net/ipv6/conf/<iface>/dad_transmits.
+	DADTransmits *int32 `json:"dadTransmits,omitempty"`
+
+	// RouterSolicitationDelay controls how long the interface waits before
+	// sending its first Router Solicitation through
+	// /proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay, in seconds.
+	RouterSolicitationDelay *int32 `json:"routerSolicitationDelay,omitempty"`
 }
 ```
 
@@ -98,13 +108,17 @@ type InterfaceConfig struct {
 * **arpIgnore** (int32, optional): Which ARP requests the interface answers. Valid values are 0, 1, 2, 3, and 8. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_ignore`.
 * **arpAnnounce** (int32, optional): The source address the interface uses in ARP requests, from 0 to 2. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_announce`.
 * **acceptRA** (int32, optional): Whether the interface accepts IPv6 router advertisements, from 0 to 2. Sets `/proc/sys/net/ipv6/conf/<iface>/accept_ra`.
+* **dadTransmits** (int32, optional): How many Duplicate Address Detection probes the interface sends for a new IPv6 address. Sets `/proc/sys/net/ipv6/conf/<iface>/dad_transmits`.
+* **routerSolicitationDelay** (int32, optional): How many seconds the interface waits before sending its first Router Solicitation. Sets `/proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay`.
+* **addressing** (string, optional): How the interface gets its addresses: `Static` (the default, from `addresses` or a provider profile), `DHCP`, `SLAAC`, or `Unnumbered` (subinterfaces only). See [IPv6 autoconfiguration](#ipv6-autoconfiguration-slaac).
 
 The kernel resets both ARP settings to the network namespace default when an interface
 moves into a Pod, so a value configured on the host does not survive the move and has to
 be requested here. The kernel resets `accept_ra` the same way when the interface moves.
 The kernel creates IPv6 settings only for an interface with an MTU of 1280 or more.
-Validation rejects `acceptRA` together with an explicit `mtu` below 1280. An interface
-that keeps a smaller MTU from the host fails at setup.
+Validation rejects `acceptRA`, `dadTransmits`, `routerSolicitationDelay` and
+`addressing: SLAAC` together with an explicit `mtu` below 1280. An interface that keeps a
+smaller MTU from the host fails at setup.
 Setups that attach several interfaces sharing one IP subnet, such as
 multi-NIC RDMA nodes, typically need `arpIgnore: 1` and `arpAnnounce: 2`. Without them an
 interface can answer ARP for another interface's address, or send requests with a source
@@ -115,6 +129,71 @@ for both settings. A per-interface setting cannot reduce the effective value bel
 `conf/all`. New IPv4 network namespaces normally inherit `conf/all` and `conf/default`
 from the initial network namespace, subject to `net.core.devconf_inherit_init_net`.
 DRANET only changes the per-interface value.
+
+#### IPv6 autoconfiguration (SLAAC)
+
+On fabrics where the routers hand out IPv6 prefixes, the host interfaces get their
+addresses and default routes from Router Advertisements rather than from any
+configuration DRANET can read off the node:
+
+```
+rdma0  inet6 fdcd:8200:cde5:20b7:a20:e7ff:fe96:708/64 dynamic mngtmpaddr proto kernel_ra
+default via fe80::b061:4eff:fe0c:d0b7 dev rdma0 proto ra metric 1024 expires 1536sec
+```
+
+By default DRANET copies the host's addresses into the Pod as static ones. That works,
+but the copy has no lifetimes and no relationship to the advertisement that produced it.
+`addressing: SLAAC` instead lets the Pod autoconfigure itself:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: rdma-slaac
+spec:
+  devices:
+    requests:
+    - name: rdma
+      exactly:
+        deviceClassName: dra.net
+    config:
+    - requests: ["rdma"]
+      opaque:
+        driver: dra.net
+        parameters:
+          interface:
+            addressing: SLAAC
+            arpIgnore: 1
+            arpAnnounce: 2
+```
+
+With `addressing: SLAAC` DRANET:
+
+* inherits no addresses from the host, and leaves out the host routes the Pod will
+  re-learn from advertisements (`proto ra`);
+* defaults `acceptRA: 2`, `dadTransmits: 0` and `routerSolicitationDelay: 0`, all of
+  which you can override. The kernel resets these when the interface moves, so they have
+  to be requested; the last two are what bring address acquisition down from a couple of
+  seconds to a few milliseconds, which is what makes it fit the runtime's deadline;
+* waits, after bringing the interface up inside the Pod, for a global unicast IPv6
+  address that has finished duplicate address detection, and records it in the
+  ResourceClaim's `status.devices[].networkData.ips` along with a `SLAACReady` condition.
+
+The wait is bounded by `--slaac-ready-timeout` (1.5s by default) and by the deadline of
+the runtime request that triggered it, minus a reserve for rollback. If no address
+arrives in time, DRANET moves the interface back to the host under its original name and
+fails the sandbox, so the kubelet retries rather than starting a workload on an interface
+with no source address.
+
+If that deadline has already passed before the wait starts — attaching several NICs one at
+a time can outrun the runtime's timeout for a plugin request, 2s in both containerd and
+CRI-O — DRANET logs a warning and finishes the wait on `--slaac-ready-timeout` instead. At
+that point the runtime is no longer waiting for the request: it will not act on an error
+and the Pod starts either way, so taking the interface back would only leave the Pod
+without a NIC it is about to use. A rollback still happens if the wait itself fails.
+
+`SLAAC` requires a passthrough interface: subinterface types such as IPVLAN do not get
+per-interface sysctls, and it cannot be combined with `addresses` or with `acceptRA: 0`.
 
 #### Route Configuration (RouteConfig)
 

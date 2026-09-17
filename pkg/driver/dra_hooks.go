@@ -336,9 +336,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			}
 		}
 
-		// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
-		// ... but we DO NOT apply them in the root namespace
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeDHCP {
+		// Resolve how the interface gets its addresses. DHCP is resolved here, in
+		// the root namespace, so the slow part is out of the runtime hooks; SLAAC
+		// resolves itself inside the Pod; anything else inherits what the host has.
+		switch iface := deviceCfg.NetworkInterfaceConfigInPod.Interface; {
+		case iface.Addressing == apis.AddressingModeDHCP:
+			// Do a DHCP request to gather the network parameters (IPs and Routes)
+			// ... but we DO NOT apply them in the root namespace
 			klog.V(2).Infof("trying to get network configuration via DHCP")
 			contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -352,7 +356,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 					deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
 				}
 			}
-		} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
+		case iface.Addressing == apis.AddressingModeSLAAC:
+			// The Pod autoconfigures from router advertisements on its own, so
+			// there is nothing to inherit. Copying the host's address in would
+			// pin a second, permanent copy of an address the kernel is about to
+			// manage with lifetimes of its own.
+			klog.V(2).Infof("device %s: interface %s uses SLAAC; not inheriting host addresses", result.Device, ifName)
+		case !iface.IsSubinterface() && len(iface.Addresses) == 0:
 			// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
 			// get the existing IP addresses
 			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
@@ -403,7 +413,8 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 
 		// For non-subinterface type, obtain the routes and rules associated with the interface.
 		if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-			routes, tables, err := getRouteInfo(nlHandle, ifName, link)
+			slaac := deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC
+			routes, tables, err := getRouteInfo(nlHandle, ifName, link, slaac)
 			if err != nil {
 				errorList = append(errorList, err)
 				continue
@@ -665,10 +676,12 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 }
 
 // getRouteInfo retrieves all routes associated with a given network interface.
+// When dropAdvertised is set, routes the host learned from IPv6 router
+// advertisements are left out, because the Pod learns them itself.
 // It filters out routes that are not suitable for pod namespaces, such as
 // routes in the local table. It returns the list of suitable routes and a set
 // of the route table IDs to which they belong.
-func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]apis.RouteConfig, sets.Set[int], error) {
+func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link, dropAdvertised bool) ([]apis.RouteConfig, sets.Set[int], error) {
 	routes := []apis.RouteConfig{}
 	tables := sets.Set[int]{}
 	filter := &netlink.Route{
@@ -680,6 +693,14 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 	}
 	for _, route := range rl {
 		routeCfg := apis.RouteConfig{}
+		// A route learned from a router advertisement is re-learned inside the
+		// Pod when it autoconfigures, with a lifetime the kernel refreshes.
+		// Copying it in as a static route would instead leave the Pod with a
+		// gateway that is never revalidated.
+		if dropAdvertised && route.Protocol == unix.RTPROT_RA {
+			klog.V(5).Infof("Skipping advertised route %s for interface %s: the Pod re-learns it from router advertisements", route.String(), ifName)
+			continue
+		}
 		// routes need a destination
 		if route.Dst == nil {
 			klog.V(5).Infof("Skipping route %s for interface %s because it has no destination", route.String(), ifName)

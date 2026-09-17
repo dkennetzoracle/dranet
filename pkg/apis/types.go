@@ -59,7 +59,7 @@ type InterfaceConfig struct {
 	Type InterfaceType `json:"type,omitempty"`
 
 	// Addressing selects the IP address configuration strategy:
-	// "Static" (default), "DHCP", or "Unnumbered".
+	// "Static" (default), "DHCP", "SLAAC", or "Unnumbered".
 	// An empty value is treated as "Static".
 	Addressing AddressingMode `json:"addressing,omitempty"`
 
@@ -126,6 +126,25 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
 
+	// DADTransmits controls how many Duplicate Address Detection probes the
+	// interface sends for a new IPv6 address through
+	// /proc/sys/net/ipv6/conf/<iface>/dad_transmits. 0 disables DAD, which makes
+	// an autoconfigured address usable immediately instead of holding it
+	// tentative for about a second per probe.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	DADTransmits *int32 `json:"dadTransmits,omitempty"`
+
+	// RouterSolicitationDelay controls how long the interface waits before
+	// sending its first Router Solicitation through
+	// /proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay, in seconds.
+	// The kernel default of 1 spreads solicitations out across a shared link; 0
+	// solicits immediately, which matters when the Pod has to acquire an address
+	// within the runtime's sandbox deadline.
+	// Moving the interface resets it to the destination namespace default, so it
+	// must be requested explicitly.
+	RouterSolicitationDelay *int32 `json:"routerSolicitationDelay,omitempty"`
+
 	// VRF specifies the Virtual Routing and Forwarding domain this interface should belong to.
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.
@@ -166,6 +185,12 @@ const (
 	AddressingModeStatic AddressingMode = "Static"
 	// AddressingModeDHCP obtains network configuration via DHCP.
 	AddressingModeDHCP AddressingMode = "DHCP"
+	// AddressingModeSLAAC lets the kernel autoconfigure the interface from IPv6
+	// router advertisements instead of copying the host's addresses in. The
+	// driver enables router advertisement acceptance, brings the interface up,
+	// and waits for the resulting address to become usable before the Pod
+	// starts. It is only valid for passthrough interfaces.
+	AddressingModeSLAAC AddressingMode = "SLAAC"
 	// AddressingModeUnnumbered brings the interface up without driver configuring
 	// IP addresses or routes. Valid only for subinterfaces.
 	AddressingModeUnnumbered AddressingMode = "Unnumbered"
