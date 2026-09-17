@@ -1,0 +1,88 @@
+# 4rail: the SR-IOV VF of each rail, moved into the Pod.
+#
+# A multi-planar BM.GPU.GB300.4 node has 4 ConnectX-8 SuperNICs, one per rail.
+# Each SuperNIC exposes its planes as ports of a single RDMA device
+# (rdma_rail<N>, PF netdev rdma<N>) and carves out one SR-IOV VF named
+# rdma_vf_rail<N>. The VF is the endpoint the fabric addresses: it carries the
+# rail's Router Advertisement address, sits in VRF vrf_r<N>, and reports
+# 200 Gb/s. The per-plane netdevs rdma_p1..3_rail<N> have no RDMA device and
+# are netns-local, so the VFs are what a Pod can claim. Rails 0-1 sit on NUMA 0,
+# rails 2-3 on NUMA 1, and each rail is its own /64 with its own router.
+#
+# Every VF gets its address and its default route from a Router Advertisement,
+# so the claim asks for `addressing: SLAAC` rather than letting DRANET copy the
+# host's address in as a static one. DRANET enables router advertisements on
+# the interface inside the Pod, waits for the address to finish duplicate
+# address detection, and reports it in the claim status. If no advertisement
+# arrives within the deadline the interface goes back to the host and the
+# sandbox fails, so the Pod never starts on a rail with no routable GID.
+#
+# arpIgnore/arpAnnounce are the usual multi-NIC RDMA settings: without them an
+# interface can answer for another interface's address or source requests from
+# the wrong subnet.
+#
+# The selector matches by name. `dra.net/isSriovVf == true` together with
+# `dra.net/rdma == true` selects the same four devices without depending on
+# the naming.
+#
+# Only the NICs come from DRA here. GPUs are requested through the NVIDIA device
+# plugin (`nvidia.com/gpu`) in the workload, which is how this cluster exposes
+# them; add a `gpu.nvidia.com` request instead if the NVIDIA DRA driver is
+# installed.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 4rail
+spec:
+  spec:
+    devices:
+      requests:
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 4
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                has(device.attributes["dra.net"].ifName) &&
+                device.attributes["dra.net"].ifName.startsWith("rdma_vf_rail")
+      config:
+      - requests: ["nic"]
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              addressing: SLAAC
+              arpIgnore: 1
+              arpAnnounce: 2
+---
+# 1nic-slaac: a single rail VF, for checking autoconfiguration on its own
+# without standing up an MPI job.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1nic-slaac
+spec:
+  spec:
+    devices:
+      requests:
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 1
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                has(device.attributes["dra.net"].ifName) &&
+                device.attributes["dra.net"].ifName == "rdma_vf_rail0"
+      config:
+      - requests: ["nic"]
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              addressing: SLAAC
+              arpIgnore: 1
+              arpAnnounce: 2

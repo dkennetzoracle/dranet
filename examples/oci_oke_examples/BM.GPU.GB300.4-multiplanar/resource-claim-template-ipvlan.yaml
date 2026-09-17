@@ -1,0 +1,63 @@
+# 4rail-ipvlan: an IPVLAN child of each rail's VF.
+#
+# The passthrough variant in resource-claim-template.yaml moves the rail VF into
+# the Pod. This one leaves the VF on the host, in its VRF, with its address,
+# and gives the Pod an IPVLAN child of it instead. Measured on this cluster:
+#
+#   RunPodSandbox for 4 NICs   passthrough 0.8-0.9 s   ipvlan 18-96 ms
+#   VF after the Pod exits     returned and restored   untouched: UP, addressed,
+#                              into its VRF by DraNet  still in its VRF
+#   Pods per rail              1                       many
+#
+# The container runtime allows a plugin roughly 2s per RunPodSandbox. Moving
+# four VFs fits, but not by much, and an IPVLAN child does not come close.
+#
+# REQUIRES the RDMA subsystem in shared netns mode on every node that serves
+# this claim: DRANET rejects a subinterface claim on an RDMA device in
+# exclusive mode, and the kernel only exposes the child's GIDs inside the Pod
+# namespace in shared mode. See the README for how to set it, and what it
+# costs.
+#
+# Addressing is Unnumbered: DRANET configures no addresses and each child
+# autoconfigures from its rail's Router Advertisement. A child shares its
+# parent's MAC but the kernel still gives it a distinct interface identifier,
+# so children do not collide with the parent or with each other:
+#
+#   rdma_vf_rail0 (VF, host)  fdcd:8200:cde5:20b7:00cd:f6ff:fe70:49cd
+#   child in Pod A            fdcd:8200:cde5:20b7:02cd:f600:0170:49cd
+#
+# The kernel resets the per-interface IPv6 sysctls when it creates the child,
+# and with the defaults (dad_transmits=1, router_solicitation_delay up to 1s)
+# the address is not usable for 1-2 seconds after the Pod starts. Setting them
+# here brings that down to tens of milliseconds. `addressing: SLAAC` would say
+# the same thing and add the readiness wait, but the wait and its rollback are
+# implemented for moved interfaces only, so it is rejected for subinterfaces.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 4rail-ipvlan
+spec:
+  spec:
+    devices:
+      requests:
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 4
+          selectors:
+          - cel:
+              expression: >-
+                device.attributes["dra.net"].rdma == true &&
+                has(device.attributes["dra.net"].ifName) &&
+                device.attributes["dra.net"].ifName.startsWith("rdma_vf_rail")
+      config:
+      - requests: ["nic"]
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              type: IPVLAN
+              addressing: Unnumbered
+              acceptRA: 2
+              dadTransmits: 0
+              routerSolicitationDelay: 0

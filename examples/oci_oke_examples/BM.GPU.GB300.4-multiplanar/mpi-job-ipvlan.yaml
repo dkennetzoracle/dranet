@@ -1,0 +1,133 @@
+# all_reduce_perf across 2 x BM.GPU.GB300.4 (8 ranks) over the multi-planar
+# RoCEv2 fabric, using IPVLAN children of the rail VFs rather than moving the
+# VFs into the Pods (the `4rail-ipvlan` ResourceClaimTemplate). Requires the
+# RDMA subsystem in shared netns mode; see the README.
+#
+# NCCL_IB_GID_INDEX=7, not 3. The GID table is namespace-filtered and the
+# indices are absolute: the Pod sees zeros where the host VF's four GIDs sit
+# (0-3) and its own child's entries above them, link-local at 4/5 and the
+# routable address at 6/7. 7 is the RoCE v2 global GID and it lands there
+# uniformly on all four rails. Verify rather than assume:
+#   cat /sys/class/infiniband/rdma_vf_rail0/ports/1/gid_attrs/types/7   -> RoCE v2
+#   cat /sys/class/infiniband/rdma_vf_rail0/ports/1/gids/7
+#
+# NCCL_MNNVL_ENABLE=0 and NCCL_NVLS_ENABLE=0 on purpose: these nodes share one
+# NVLink clique, and with MNNVL enabled NCCL carries inter-node traffic over
+# NVLink and never touches the rail NICs. Disabling it forces the NET/IB path,
+# which is what exercises the autoconfigured addresses on the IPVLAN children.
+# See mpi-job-ipvlan-mnnvl.yaml for the NVLink number.
+#
+# The NCCL environment is the OCI multi-planar tuning profile without
+# NCCL_TOPO_FILE and the SPCX plugin, which this image does not carry. The
+# exact-match `=` form of NCCL_IB_HCA matters in shared RDMA netns mode, where
+# the Pod sees every RDMA device on the node but only the claimed rails have
+# GIDs in its namespace.
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: nccl-multiplanar-ipvlan
+spec:
+  slotsPerWorker: 4
+  runPolicy:
+    cleanPodPolicy: Running
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          # The launcher only runs mpirun, but the image is arm64 and the GPU
+          # nodes carry a NoSchedule taint, so it needs both to land on one.
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: nccl
+            image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              NUM_GPUS=4
+              NUM_HOSTS=$(sed -n '$=' /etc/mpi/hostfile)
+              NP=$((NUM_HOSTS*NUM_GPUS))
+              while ! (for host in $(awk '{print $1}' /etc/mpi/hostfile); do
+                ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $host exit 2>/dev/null || exit 1
+              done); do
+                echo "Waiting for workers to be ready..."
+                sleep 5
+              done
+              echo "All workers ready: $NUM_HOSTS nodes x $NUM_GPUS GPUs = $NP ranks"
+              mpirun \
+                --allow-run-as-root \
+                --bind-to numa \
+                --mca coll ^hcoll \
+                -x LD_LIBRARY_PATH \
+                -x NCCL_DEBUG=INFO \
+                -x UCX_NET_DEVICES=eth0 \
+                -x RX_QUEUE_LEN=8192 \
+                -x IB_RX_QUEUE_LEN=8192 \
+                -x HCOLL_ENABLE_MCAST_ALL=0 \
+                -x coll_hcoll_enable=0 \
+                -x NCCL_SOCKET_IFNAME=eth0 \
+                -x NCCL_IB_HCA="=rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3" \
+                -x NCCL_ASYNC_ERROR_HANDLING=1 \
+                -x NCCL_IB_TIMEOUT=16 \
+                -x NCCL_IB_RETRY_CNT=7 \
+                -x NCCL_IB_SL=0 \
+                -x NCCL_IB_TC=96 \
+                -x NCCL_IB_GID_INDEX=7 \
+                -x NCCL_NVLS_ENABLE=0 \
+                -x NCCL_MNNVL_ENABLE=0 \
+                -x NCCL_WORK_FIFO_BYTES=0 \
+                -x NCCL_NET_GDR_C2C=1 \
+                -x NCCL_CUMEM_ENABLE=1 \
+                -x NCCL_IGNORE_CPU_AFFINITY=1 \
+                -x NCCL_NET_PLUGIN=none \
+                -x NCCL_NET=IB \
+                -x NCCL_IB_ADAPTIVE_ROUTING=1 \
+                -x NCCL_IB_SPLIT_DATA_ON_QPS=0 \
+                -x NCCL_IB_QPS_PER_CONNECTION=16 \
+                -np $NP \
+                /workspace/nccl-tests/build/all_reduce_perf -b 1G -e 16G -f 2 -g 1 -n 50
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    training.kubeflow.org/job-name: nccl-multiplanar-ipvlan
+                    training.kubeflow.org/job-role: worker
+                topologyKey: kubernetes.io/hostname
+          automountServiceAccountToken: false
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          resourceClaims:
+          - name: rail-nics
+            resourceClaimTemplateName: 4rail-ipvlan
+          containers:
+          - name: nccl
+            image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
+            volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            resources:
+              limits:
+                nvidia.com/gpu: 4
+              claims:
+              - name: rail-nics
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
