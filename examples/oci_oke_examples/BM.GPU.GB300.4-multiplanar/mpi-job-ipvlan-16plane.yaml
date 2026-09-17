@@ -1,0 +1,145 @@
+# all_reduce_perf over all 16 planes with the OCI multi-planar tuning profile.
+#
+# This is the OCI HPC GB300 multi-planar mpirun profile translated to an MPIJob:
+# 16 HCAs, NCCL_IB_QPS_PER_CONNECTION=16, adaptive routing, TC=96, and the large
+# message sweep -b 1G -e 16G -f 2 -g 1 -n 50. It measured 361.61 GB/s busbw at
+# 16 GiB, 2.2x the 166.10 GB/s the same fabric gives over 4 planes.
+#
+# Four values differ from the Slurm original. Each is a substitution forced by
+# this shape, not a tuning change:
+#
+#   NCCL_IB_HCA        The original reads ${MP_HCAS}. Substituted with this
+#                      shape's 16 plane devices. Note the mixed naming: plane 0
+#                      of each rail is rdma_rail<N>, the other three are mlx5_*.
+#                      The `=` prefix forces exact matching, which matters in
+#                      shared netns mode because the Pod can see every RDMA
+#                      device on the node, not just the claimed ones.
+#   NCCL_IB_GID_INDEX  7, not 3. The GID table is namespace-filtered with
+#                      absolute indices: the host PF holds 0-3, so the Pod sees
+#                      zeros there and its IPVLAN child's routable RoCE v2 GID
+#                      at 7. Verified on all 16 devices.
+#   NCCL_TOPO_FILE     Dropped. /opt/oci-hpc/healthchecks/GB300MP.xml is present
+#                      on these nodes but describes the SR-IOV Data-Direct
+#                      variant: rdma_vf_rail0..3_dma at 0008/0009/0018/0019:
+#                      03:00.0. This shape has no rdma_vf_* device at all, and
+#                      its 16 plane PFs live at 0000/0002/0010/0012:03:00.0-.3.
+#                      Handing NCCL a topology that names absent NICs would
+#                      misdescribe the node.
+#   NCCL_NET_PLUGIN    none. The original uses ${SPCX_SO}; no NCCL net plugin
+#                      exists on these nodes or in this image.
+#
+# NCCL_NVLS_ENABLE and NCCL_MNNVL_ENABLE are 0 so that this job measures the
+# network. With them on NCCL collapses both physical nodes into one communicator
+# (nNodes 1 localRanks 8 MNNVL 1), stops using the NICs, and measures NVLink
+# instead -- 839.19 GB/s. See mpi-job-ipvlan-16plane-mnnvl.yaml for that run and
+# compute-domain.yaml for the ComputeDomain it requires; without one both abort
+# with `Cuda failure 801 'operation not supported'`.
+#
+# 361.61 GB/s is 90.4% of this node's 400 GB/s of NIC (16 planes x 200 Gb/s), so
+# the fabric is saturated here rather than under-tuned.
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: nccl-mp16-tuned
+spec:
+  slotsPerWorker: 4
+  runPolicy:
+    cleanPodPolicy: Running
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: nccl
+            image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              NUM_HOSTS=$(sed -n '$=' /etc/mpi/hostfile)
+              NP=$((NUM_HOSTS*4))
+              while ! (for host in $(awk '{print $1}' /etc/mpi/hostfile); do
+                ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $host exit 2>/dev/null || exit 1
+              done); do echo "Waiting for workers to be ready..."; sleep 5; done
+              echo "All workers ready: $NUM_HOSTS nodes x 4 GPUs = $NP ranks"
+              mpirun --bind-to numa \
+                --allow-run-as-root \
+                --mca coll ^hcoll \
+                -x LD_LIBRARY_PATH \
+                -x NCCL_DEBUG=INFO \
+                -x UCX_NET_DEVICES=eth0 \
+                -x RX_QUEUE_LEN=8192 \
+                -x IB_RX_QUEUE_LEN=8192 \
+                -x HCOLL_ENABLE_MCAST_ALL=0 \
+                -x coll_hcoll_enable=0 \
+                -x NCCL_SOCKET_IFNAME=eth0 \
+                -x NCCL_IB_HCA="=rdma_rail0,mlx5_1,mlx5_0,mlx5_2,rdma_rail1,mlx5_4,mlx5_3,mlx5_5,rdma_rail2,mlx5_7,mlx5_6,mlx5_9,rdma_rail3,mlx5_10,mlx5_11,mlx5_12" \
+                -x NCCL_ASYNC_ERROR_HANDLING=1 \
+                -x NCCL_IB_TIMEOUT=16 \
+                -x NCCL_IB_RETRY_CNT=7 \
+                -x NCCL_IB_SL=0 \
+                -x NCCL_IB_TC=96 \
+                -x NCCL_IB_GID_INDEX=7 \
+                -x NCCL_NVLS_ENABLE=0 \
+                -x NCCL_MNNVL_ENABLE=0 \
+                -x NCCL_WORK_FIFO_BYTES=0 \
+                -x NCCL_NET_GDR_C2C=1 \
+                -x NCCL_CUMEM_ENABLE=1 \
+                -x NCCL_IGNORE_CPU_AFFINITY=1 \
+                -x NCCL_NET_PLUGIN=none \
+                -x NCCL_NET=IB \
+                -x NCCL_IB_ADAPTIVE_ROUTING=1 \
+                -x NCCL_IB_SPLIT_DATA_ON_QPS=0 \
+                -x NCCL_IB_QPS_PER_CONNECTION=16 \
+                --np $NP \
+                /workspace/nccl-tests/build/all_reduce_perf -b 1G -e 16G -f 2 -g 1 -n 50
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    training.kubeflow.org/job-name: nccl-mp16-tunedb
+                    training.kubeflow.org/job-role: worker
+                topologyKey: kubernetes.io/hostname
+          automountServiceAccountToken: false
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: imex
+            hostPath:
+              path: /dev/nvidia-caps-imex-channels
+              type: Directory
+          resourceClaims:
+          - name: rail-nics
+            resourceClaimTemplateName: mp16-ipvlan
+          containers:
+          - name: nccl
+            image: iad.ocir.io/idxzjcdglx2s/nccl-tests:cuda-13.1.1-ubuntu-24.04-nccl-2.29.3-020926.1
+            volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /dev/nvidia-caps-imex-channels
+              name: imex
+            resources:
+              limits:
+                nvidia.com/gpu: 4
+              claims:
+              - name: rail-nics
+            securityContext:
+              privileged: true
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
