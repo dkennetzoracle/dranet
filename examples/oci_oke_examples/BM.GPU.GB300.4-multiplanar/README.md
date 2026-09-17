@@ -151,8 +151,10 @@ rejected for subinterface types.
 | `deviceclass.yaml` | `DeviceClass` for `deviceClassName: dra.net` |
 | `resource-claim-template.yaml` | `4rail` / `1nic-slaac` — passthrough, `addressing: SLAAC` |
 | `resource-claim-template-ipvlan.yaml` | `4rail-ipvlan` — IPVLAN children, `addressing: Unnumbered` |
+| `resource-claim-template-ipvlan-16plane.yaml` | `mp16-ipvlan` — all 16 planes as IPVLAN children |
 | `mpi-job.yaml` | `all_reduce_perf`, 2 workers x 4 GPUs, passthrough claims |
 | `mpi-job-ipvlan.yaml` | the same over IPVLAN claims (`NCCL_IB_GID_INDEX=7`) |
+| `mpi-job-ipvlan-16plane.yaml` | all 16 planes with the OCI multi-planar tuning profile |
 
 ## Usage
 
@@ -192,3 +194,55 @@ DRA driver is installed, add a `gpu.nvidia.com` request to the claim template in
 Both runs report `NET/IB : Using [0]rdma_rail0:1/RoCE [1]rdma_rail1:1/RoCE
 [2]rdma_rail2:1/RoCE [3]rdma_rail3:1/RoCE [RO]` and `Using network IB`, confirming the
 traffic went over the claimed rails rather than NVLink.
+
+### All 16 planes, OCI multi-planar tuning profile
+
+`mpi-job-ipvlan-16plane.yaml`, same 2 nodes and 8 ranks,
+`all_reduce_perf -b 1G -e 16G -f 2 -g 1 -n 50`, correctness checking on
+(`validation: 1`, 0 wrong values in every row), `Out of bounds values: 0 OK`:
+
+| size | busbw | algbw |
+|---|---|---|
+| 1 GiB | 349.77 GB/s | 199.87 GB/s |
+| 2 GiB | 355.92 GB/s | 203.38 GB/s |
+| 4 GiB | 359.13 GB/s | 205.22 GB/s |
+| 8 GiB | 360.81 GB/s | 206.17 GB/s |
+| 16 GiB | **361.61 GB/s** | 206.63 GB/s |
+| avg | 357.441 GB/s | |
+
+Using all 16 planes is worth **2.2x** over 4: 360.81 GB/s against 166.10 GB/s at 8 GiB.
+NCCL selected all sixteen —
+`NET/IB : Using [0]rdma_rail0_dma ... [15]mlx5_12_dma [RO]` — and the comm reports
+`nNodes 2 localRanks 4 MNNVL 0`, so the traffic genuinely crossed the fabric rather than
+NVLink.
+
+The attach cost stays negligible at that width:
+
+| | 4 planes | 16 planes |
+|---|---|---|
+| `PrepareResourceClaim` (host side, unbudgeted) | 48 ms | 465 ms |
+| `RunPodSandbox` (runtime hook, ~2s budget) | 8 - 88 ms | **28.6 ms** |
+
+### NVLS and MNNVL do not work in a Pod here
+
+Both are in the OCI profile and both fail, with the same CUDA error in different
+transports:
+
+```
+NVLS=1    transport/nvls.cc:91  NCCL WARN Cuda failure 801 'operation not supported'
+MNNVL=1   transport/p2p.cc:281  NCCL WARN Cuda failure 801 'operation not supported'
+```
+
+MNNVL gets much further: with `/dev/nvidia-caps-imex-channels` hostPath-mounted into the
+Pod, `nvidia-smi` reports Fabric `Completed`/`Success`, `CliqueId 3666`, `Healthy`, NCCL
+logs `MNNVL 1 cliqueId e52 cliqueSize 8` and builds channels `via P2P/MNNVL` — and only
+then fails to map remote memory. Without the mount it does not start, reporting `MNNVL is
+available but not working on this system`.
+
+So the device node is necessary but not sufficient: both features need a provisioned IMEX
+domain, which is what the NVIDIA DRA driver's `ComputeDomain` is for. It is not installed
+on this cluster.
+
+Worth knowing even once it is: with MNNVL working, NCCL collapsed the two physical nodes
+into `nNodes 1 localRanks 8` and stopped using the NICs altogether. An MNNVL run therefore
+does not measure the rail fabric — keep `NCCL_MNNVL_ENABLE=0` for that.

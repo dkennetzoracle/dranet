@@ -1,0 +1,44 @@
+# mp16-ipvlan: an IPVLAN child on all 16 planes.
+#
+# The 4rail variants take plane 0 of each rail. This one takes every plane of
+# every rail, which is what a multi-planar tuning profile expects: 4 ConnectX-8
+# SuperNICs x 4 plane PFs = 16 RDMA devices per node, paired with
+# NCCL_IB_QPS_PER_CONNECTION=16 and NCCL_IB_ADAPTIVE_ROUTING=1.
+#
+# This only works as IPVLAN. Sixteen passthrough attaches cost ~16s against a
+# container runtime budget of about 2s, and would leave all 16 rails DOWN and
+# unaddressed when the Pod exits. Measured here with IPVLAN:
+#
+#   PrepareResourceClaim (host side, slow phase)   465 ms
+#   RunPodSandbox        (runtime hook, budgeted)   28.6 ms
+#
+# Requires the RDMA subsystem in shared netns mode on every node serving the
+# claim; see the README. Each child autoconfigures from its plane's Router
+# Advertisement, and the routable RoCE v2 GID lands at index 7 on all 16 devices
+# (verified: the two devices without one, mlx5_8 and mlx5_17, are the unclaimed
+# eth NICs).
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: mp16-ipvlan
+spec:
+  spec:
+    devices:
+      requests:
+      - name: nic
+        exactly:
+          deviceClassName: dra.net
+          count: 16
+          selectors:
+          - cel:
+              expression: >-
+                has(device.attributes["dra.net"].ifName) &&
+                device.attributes["dra.net"].ifName.startsWith("rdma_p")
+      config:
+      - requests: ["nic"]
+        opaque:
+          driver: dra.net
+          parameters:
+            interface:
+              type: IPVLAN
+              addressing: Unnumbered
