@@ -152,9 +152,11 @@ rejected for subinterface types.
 | `resource-claim-template.yaml` | `4rail` / `1nic-slaac` — passthrough, `addressing: SLAAC` |
 | `resource-claim-template-ipvlan.yaml` | `4rail-ipvlan` — IPVLAN children, `addressing: Unnumbered` |
 | `resource-claim-template-ipvlan-16plane.yaml` | `mp16-ipvlan` — all 16 planes as IPVLAN children |
+| `compute-domain.yaml` | `ComputeDomain` — required for MNNVL and NVLS |
 | `mpi-job.yaml` | `all_reduce_perf`, 2 workers x 4 GPUs, passthrough claims |
 | `mpi-job-ipvlan.yaml` | the same over IPVLAN claims (`NCCL_IB_GID_INDEX=7`) |
-| `mpi-job-ipvlan-16plane.yaml` | all 16 planes with the OCI multi-planar tuning profile |
+| `mpi-job-ipvlan-16plane.yaml` | all 16 planes, OCI tuning profile, RoCE path |
+| `mpi-job-ipvlan-16plane-mnnvl.yaml` | the same with NVLS and MNNVL on, NVLink path |
 
 ## Usage
 
@@ -223,26 +225,60 @@ The attach cost stays negligible at that width:
 | `PrepareResourceClaim` (host side, unbudgeted) | 48 ms | 465 ms |
 | `RunPodSandbox` (runtime hook, ~2s budget) | 8 - 88 ms | **28.6 ms** |
 
-### NVLS and MNNVL do not work in a Pod here
+### NVLink path: NVLS and MNNVL, via ComputeDomain
 
-Both are in the OCI profile and both fail, with the same CUDA error in different
-transports:
+`mpi-job-ipvlan-16plane-mnnvl.yaml` — the same 16-plane profile with
+`NCCL_NVLS_ENABLE=1` and `NCCL_MNNVL_ENABLE=1` as the OCI profile writes them,
+which needs the `ComputeDomain` in `compute-domain.yaml`:
+
+| size | NVLink busbw | RoCE busbw |
+|---|---|---|
+| 1 GiB | 722.06 GB/s | 349.38 GB/s |
+| 2 GiB | 820.16 GB/s | 355.06 GB/s |
+| 4 GiB | 828.93 GB/s | 358.36 GB/s |
+| 8 GiB | 835.16 GB/s | 360.61 GB/s |
+| 16 GiB | **839.19 GB/s** | **361.51 GB/s** |
+| avg | 809.137 GB/s | 357.111 GB/s |
+
+Both columns are 2 x GB300.4, 8 ranks, `-b 1G -e 16G -f 2 -g 1 -n 50`, checking on,
+`Out of bounds values: 0 OK`. The only difference is `NCCL_NVLS_ENABLE` and
+`NCCL_MNNVL_ENABLE`.
+
+Each number is close to its own ceiling, which is why they differ by 2.3x rather than
+by anything tunable:
+
+| path | per-node capacity | measured | efficiency |
+|---|---|---|---|
+| RoCE, 16 x 200 Gb/s planes | 400 GB/s | 361.51 GB/s | 90.4% |
+| NVLink, 18 x 53.125 GB/s per GPU | 956.25 GB/s | 839.19 GB/s | 87.8% |
+
+So 361 GB/s is not a tuning miss — the fabric is saturated, and no NCCL setting gets
+400 GB/s of NIC to carry 800. Both GB300 variants have the same aggregate, incidentally:
+this shape is 16 x 200 Gb/s, the SR-IOV Data-Direct shape is 4 x 800 Gb/s, both 3200 Gb/s.
+
+Installing the ComputeDomain did not change the RoCE result (361.51 vs 361.61 GB/s
+measured before it existed), so the two paths are independent.
+
+**With MNNVL active NCCL stops using the NICs.** It collapses both physical nodes into one
+communicator — `nNodes 1 localRanks 8 MNNVL 1` — so the rail claim is carried but idle.
+An MNNVL run measures NVLink, not the fabric. Keep both jobs.
+
+### Why ComputeDomain is not optional
+
+Without one, both features abort at init with the same CUDA error in different transports:
 
 ```
 NVLS=1    transport/nvls.cc:91  NCCL WARN Cuda failure 801 'operation not supported'
 MNNVL=1   transport/p2p.cc:281  NCCL WARN Cuda failure 801 'operation not supported'
 ```
 
-MNNVL gets much further: with `/dev/nvidia-caps-imex-channels` hostPath-mounted into the
-Pod, `nvidia-smi` reports Fabric `Completed`/`Success`, `CliqueId 3666`, `Healthy`, NCCL
-logs `MNNVL 1 cliqueId e52 cliqueSize 8` and builds channels `via P2P/MNNVL` — and only
-then fails to map remote memory. Without the mount it does not start, reporting `MNNVL is
-available but not working on this system`.
+The misleading part is how far MNNVL gets on a plain hostPath mount of
+`/dev/nvidia-caps-imex-channels`: `nvidia-smi` reports the fabric `Completed`/`Success`,
+`CliqueId 3666`, `Healthy`, and NCCL logs `cliqueSize 8` and builds channels
+`via P2P/MNNVL` — then fails to map remote memory. Without the mount it does not get that
+far, reporting `MNNVL is available but not working on this system`. So the device node is
+necessary but not sufficient: the workload's GPUs must be authorised into an IMEX domain.
 
-So the device node is necessary but not sufficient: both features need a provisioned IMEX
-domain, which is what the NVIDIA DRA driver's `ComputeDomain` is for. It is not installed
-on this cluster.
-
-Worth knowing even once it is: with MNNVL working, NCCL collapsed the two physical nodes
-into `nNodes 1 localRanks 8` and stopped using the NICs altogether. An MNNVL run therefore
-does not measure the rail fabric — keep `NCCL_MNNVL_ENABLE=0` for that.
+With a ComputeDomain the same job logs `NVLS multicast support is available on dev 0
+(NVLS_NCHANNELS 24)`, `nvlsRanks 8`, and no 801 at all. The domain reports both nodes
+`Ready` under one cliqueID and runs an IMEX daemon per node.

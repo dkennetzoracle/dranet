@@ -1,0 +1,44 @@
+# ComputeDomain provisions the IMEX channels that MNNVL and NVLS need.
+#
+# This is not optional for the NVLink path, and the failure mode without it is
+# misleading: bind-mounting /dev/nvidia-caps-imex-channels into a Pod is enough
+# for MNNVL *discovery* -- nvidia-smi reports the fabric Completed/Healthy, NCCL
+# logs cliqueSize 8 and builds channels "via P2P/MNNVL" -- and then both
+# transports fail to map memory with `Cuda failure 801 'operation not
+# supported'`, from transport/p2p.cc for MNNVL and transport/nvls.cc for NVLS.
+# The device node is necessary but not sufficient; the workload's GPUs have to
+# be authorised into an IMEX domain, which is what this object does.
+#
+# With it, the same job reports `NVLS multicast support is available
+# (NVLS_NCHANNELS 24)`, `nvlsRanks 8`, no 801 at all, and 839.19 GB/s busbw
+# against 361.61 GB/s over the RoCE fabric.
+#
+# numNodes must match the number of workers sharing the domain. Install the
+# driver with:
+#
+#   helm install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
+#     --version 25.12.0 --namespace nvidia-dra-driver-gpu --create-namespace \
+#     --set resources.gpus.enabled=false \
+#     --set resources.computeDomains.enabled=true \
+#     --set controller.affinity=null \
+#     --set-json 'controller.tolerations=[{"operator":"Exists"}]' \
+#     --set 'controller.nodeSelector.kubernetes\.io/arch=amd64' \
+#     --set-json 'kubeletPlugin.tolerations=[{"operator":"Exists"}]'
+#
+# Three of those overrides are needed on OKE and are easy to miss:
+# the controller defaults to a nodeAffinity on node-role.kubernetes.io/
+# control-plane, which never matches because OKE's control plane is managed and
+# not a visible node; both it and the kubelet plugin need tolerations for the
+# nvidia.com/gpu=present:NoSchedule taint; and resources.gpus.enabled=false
+# leaves GPU allocation with the device plugin, so only the IMEX half is added.
+# Helm merges maps rather than replacing them, so clearing the affinity needs
+# `--set controller.affinity=null`, not `--set-json '...={}'`.
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: nccl-mp16-compute-domain
+spec:
+  numNodes: 2
+  channel:
+    resourceClaimTemplate:
+      name: nccl-mp16-compute-domain-channel
