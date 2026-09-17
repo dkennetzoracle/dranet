@@ -20,6 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"sigs.k8s.io/dranet/pkg/apis"
 
@@ -39,10 +42,11 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
 	}
 
-	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be
-	// set. Reject it before the link is touched so the host device stays usable.
-	if interfaceConfig.AcceptRA != nil && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
-		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
+	// The kernel creates no IPv6 settings below this MTU, so none of accept_ra,
+	// dad_transmits or router_solicitation_delay can be set. Reject it before
+	// the link is touched so the host device stays usable.
+	if interfaceConfig.HasIPv6Sysctls() && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("the IPv6 settings (acceptRA, dadTransmits, routerSolicitationDelay) require an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
 	}
 
 	// Devices can be renamed only when down
@@ -144,9 +148,10 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	}
 
 	// Apply before the link comes up so it never answers ARP or accepts router
-	// advertisements with the wrong policy.
+	// advertisements with the wrong policy. The caller restores the host-side
+	// state after a failure here, so the rollback only has to bring it back.
 	if err := applyInterfaceSysctlConfig(containerNs, ifName, interfaceConfig); err != nil {
-		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName)
+		rollbackErr := nsDetachNetdevFromNS(containerNs, containerNsPAth, ifName, hostIfName, nil)
 		return nil, fmt.Errorf("failed to apply sysctl configuration to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
 	}
 
@@ -176,16 +181,113 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	return networkData, nil
 }
 
-func nsDetachNetdev(containerNsPAth string, devName string, outName string) error {
+// nsDetachNetdev moves the interface devName back from the Pod namespace to the
+// host as outName and restores the host-side state recorded before the move.
+// A missing namespace is reported with an error that matches fs.ErrNotExist,
+// so callers can tell "already torn down" from other failures.
+func nsDetachNetdev(containerNsPAth string, devName string, outName string, hostState *HostLinkState) error {
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return fmt.Errorf("could not get network namespace from path %s for network device %s : %w", containerNsPAth, devName, err)
 	}
 	defer containerNs.Close()
-	return nsDetachNetdevFromNS(containerNs, containerNsPAth, devName, outName)
+	return nsDetachNetdevFromNS(containerNs, containerNsPAth, devName, outName, hostState)
 }
 
-func nsDetachNetdevFromNS(containerNs netns.NsHandle, containerNsPath string, devName string, outName string) error {
+// restoreHostLink puts back what a namespace move drops from an interface that
+// is on the host again: the master it was enslaved to, since a VRF slave would
+// otherwise stay outside its VRF, and its MTU, which the Pod configuration may
+// have changed. A nil state restores nothing.
+func restoreHostLink(hostDev netlink.Link, state *HostLinkState) error {
+	if state == nil {
+		return nil
+	}
+	var errs []error
+	if state.MTU > 0 && hostDev.Attrs().MTU != state.MTU {
+		if err := netlink.LinkSetMTU(hostDev, state.MTU); err != nil {
+			errs = append(errs, fmt.Errorf("failed to restore MTU %d of %s: %w", state.MTU, hostDev.Attrs().Name, err))
+		}
+	}
+	if state.Master != "" {
+		master, err := nlwrap.LinkByName(state.Master)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to find master %s to enslave %s to again: %w", state.Master, hostDev.Attrs().Name, err))
+		} else if err := netlink.LinkSetMaster(hostDev, master); err != nil {
+			errs = append(errs, fmt.Errorf("failed to enslave %s to %s again: %w", hostDev.Attrs().Name, state.Master, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// hostNetdevsForPCI lists the network interfaces the host has for a PCI
+// function. A variable so tests can stand in for sysfs.
+var hostNetdevsForPCI = func(pciAddress string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join("/sys/bus/pci/devices", pciAddress, "net"))
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names, nil
+}
+
+// returnHostLink restores an interface the kernel has handed back to the host
+// on its own, because the Pod namespace was destroyed before DraNet could
+// return it. The kernel leaves such an interface down, with its host settings
+// gone, and renames it when its name is already taken. It is found by name
+// first, then through its PCI function, renamed back if needed, restored and
+// brought up. It reports whether the interface was found at all.
+func returnHostLink(hostIfName string, state *HostLinkState) (bool, error) {
+	hostDev, err := nlwrap.LinkByName(hostIfName)
+	if err != nil {
+		if state == nil || state.PCIAddress == "" {
+			return false, nil
+		}
+		names, err := hostNetdevsForPCI(state.PCIAddress)
+		if err != nil || len(names) == 0 {
+			return false, nil
+		}
+		// A PCI function normally has one interface. With several, the one the
+		// kernel renamed carries its fallback name.
+		candidate := names[0]
+		if len(names) > 1 {
+			candidate = ""
+			for _, name := range names {
+				if strings.HasPrefix(name, "dev") {
+					candidate = name
+					break
+				}
+			}
+			if candidate == "" {
+				return false, fmt.Errorf("PCI function %s has interfaces %v and none of them can be identified as %s", state.PCIAddress, names, hostIfName)
+			}
+		}
+		hostDev, err = nlwrap.LinkByName(candidate)
+		if err != nil {
+			return false, fmt.Errorf("failed to get link %s of PCI function %s: %w", candidate, state.PCIAddress, err)
+		}
+		// Devices can be renamed only when down.
+		if err := netlink.LinkSetDown(hostDev); err != nil {
+			return true, fmt.Errorf("failed to set %s down to rename it to %s: %w", candidate, hostIfName, err)
+		}
+		if err := netlink.LinkSetName(hostDev, hostIfName); err != nil {
+			return true, fmt.Errorf("failed to rename %s back to %s: %w", candidate, hostIfName, err)
+		}
+		if hostDev, err = nlwrap.LinkByName(hostIfName); err != nil {
+			return true, fmt.Errorf("failed to get link %s after renaming it: %w", hostIfName, err)
+		}
+	}
+
+	restoreErr := restoreHostLink(hostDev, state)
+	if err := netlink.LinkSetUp(hostDev); err != nil {
+		return true, errors.Join(restoreErr, fmt.Errorf("failed to set %q up: %w", hostIfName, err))
+	}
+	return true, restoreErr
+}
+
+func nsDetachNetdevFromNS(containerNs netns.NsHandle, containerNsPath string, devName string, outName string, hostState *HostLinkState) error {
 	// to avoid golang problem with goroutines we create the socket in the
 	// namespace and use it directly
 	nhNs, err := nlwrap.NewHandleAt(containerNs)
@@ -249,14 +351,17 @@ func nsDetachNetdevFromNS(containerNs netns.NsHandle, containerNsPath string, de
 		return fmt.Errorf("failed to move interface %s to root namespace: %w", devName, err)
 	}
 
-	// Set up the interface in case host network workloads depend on it
+	// Put the host-side state back, then set up the interface in case host
+	// network workloads depend on it. A restore failure is reported after the
+	// interface is up: it is better off up and outside its master than down.
 	hostDev, err := nlwrap.LinkByName(ifName)
 	if err != nil {
 		return fmt.Errorf("failed to get link for interface %s: %w", ifName, err)
 	}
+	restoreErr := restoreHostLink(hostDev, hostState)
 
 	if err = netlink.LinkSetUp(hostDev); err != nil {
-		return fmt.Errorf("failed to set %q up: %w", ifName, err)
+		return errors.Join(restoreErr, fmt.Errorf("failed to set %q up: %w", ifName, err))
 	}
-	return nil
+	return restoreErr
 }

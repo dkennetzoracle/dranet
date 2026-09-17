@@ -212,7 +212,7 @@ func test_nhNetdev_Namespaced(t *testing.T) {
 		}
 	}()
 
-	err = nsDetachNetdev(containerNsPath, config.Name, ifaceName)
+	err = nsDetachNetdev(containerNsPath, config.Name, ifaceName, nil)
 	if err != nil {
 		t.Fatalf("failed to detach netdev from namespace: %v", err)
 	}
@@ -320,7 +320,7 @@ func test_nsAttachNetdevRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T) {
 
 	config := apis.InterfaceConfig{Name: "dranet0", AcceptRA: ptr.To[int32](0)}
 	_, err = nsAttachNetdev(name, containerNsPath, config)
-	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
+	if err == nil || !strings.Contains(err.Error(), "require an MTU of at least 1280") {
 		t.Fatalf("nsAttachNetdev() error = %v, want an MTU error", err)
 	}
 	// Events of the call arrive asynchronously; give them a moment before stopping.
@@ -431,7 +431,7 @@ func test_nsDetachNetdevFromNSUsesOpenNamespace_Namespaced(t *testing.T) {
 	if err := netns.DeleteNamed(nsName); err != nil {
 		t.Fatalf("failed to remove network namespace path: %v", err)
 	}
-	if err := nsDetachNetdevFromNS(targetNs, containerNsPath, "dranet0", ifaceName); err != nil {
+	if err := nsDetachNetdevFromNS(targetNs, containerNsPath, "dranet0", ifaceName, nil); err != nil {
 		t.Fatalf("failed to detach with open namespace handle: %v", err)
 	}
 

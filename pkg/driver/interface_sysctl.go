@@ -34,7 +34,9 @@ var sysctlProvider = sysctl.New
 
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil
+	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil ||
+		interfaceConfig.AcceptRA != nil || interfaceConfig.DADTransmits != nil ||
+		interfaceConfig.RouterSolicitationDelay != nil
 }
 
 func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
@@ -51,6 +53,15 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 	}
 	if interfaceConfig.ARPAnnounce != nil {
 		set("ipv4", "arp_announce", *interfaceConfig.ARPAnnounce)
+	}
+	// Set the solicitation and duplicate address detection behaviour before
+	// accepting advertisements, so the first solicitation the interface sends
+	// already uses the requested timing.
+	if interfaceConfig.DADTransmits != nil {
+		set("ipv6", "dad_transmits", *interfaceConfig.DADTransmits)
+	}
+	if interfaceConfig.RouterSolicitationDelay != nil {
+		set("ipv6", "router_solicitation_delay", *interfaceConfig.RouterSolicitationDelay)
 	}
 	if interfaceConfig.AcceptRA != nil {
 		name := fmt.Sprintf("net/ipv6/conf/%s/accept_ra", ifName)

@@ -46,6 +46,9 @@ The following table lists the configurable parameters and their default values:
 | `args.cloudProviderHint` | Hint for the cloud provider plugin (`GCE`, `AZURE`, `OKE`, `AWS`, `ALIBABA`, `CKS`, `webhook`, `NONE`); auto-detected if unset | binary default: `""` |
 | `args.profileProvider` | Provider for user profile configuration (`cloud`, `webhook`, `none`) | binary default: `cloud` |
 | `args.webhookURL` | HTTP, HTTPS, or Unix socket URL; required when either provider uses `webhook` | binary default: `""` |
+| `args.uplinkInterfaces` | Comma-separated host uplink interfaces to keep out of the inventory, along with their children, instead of detecting them from the default routes | binary default: `""` (detect) |
+| `args.slaacReadyTimeout` | How long a `addressing: SLAAC` interface may take to pick up an address from IPv6 router advertisements inside the Pod | binary default: `1500ms` |
+| `args.slaacRollbackReserve` | The least time a SLAAC wait leaves of the runtime request for returning the Pod's devices to the host | binary default: `500ms` |
 | `args.featureGates` | Comma-separated feature gate settings in `key=value` format | binary default: `""` |
 
 > **Note:** All `args.*` fields are optional. When omitted, the flag is not passed to the binary and the binary's built-in default applies.

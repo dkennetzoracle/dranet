@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -69,7 +70,10 @@ var (
 	webhookURL        string
 	featureGates      string
 
-	kubeletRootDir string
+	kubeletRootDir       string
+	slaacReadyTimeout    time.Duration
+	slaacRollbackReserve time.Duration
+	uplinkInterfaces     string
 
 	ready atomic.Bool
 )
@@ -88,6 +92,9 @@ func init() {
 	flag.StringVar(&profileProvider, "profile-provider", "cloud", "Provides user intent (cloud, webhook, none). 'cloud' falls back to the cloud-provider's native implementation.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
+	flag.StringVar(&uplinkInterfaces, "uplink-interfaces", "", "Comma-separated names of the host's uplink interfaces, which are kept out of the inventory along with their children. Replaces the automatic detection from the default routes. Set this on fabrics where the RDMA NICs receive a default route of their own, for example from IPv6 Router Advertisements: detection cannot tell those apart from a management uplink and excludes the whole fabric.")
+	flag.DurationVar(&slaacReadyTimeout, "slaac-ready-timeout", driver.DefaultSLAACReadyTimeout, "How long to wait for an interface using 'addressing: SLAAC' to pick up an address from IPv6 router advertisements inside the Pod, before returning the Pod's devices to the host and failing the sandbox. While the container runtime's request is live the wait is capped by its deadline minus the rollback reserve; once that deadline has passed the wait runs for this full value.")
+	flag.DurationVar(&slaacRollbackReserve, "slaac-rollback-reserve", driver.DefaultSLAACRollbackReserve, "The least time a SLAAC wait leaves of the container runtime's request for moving the Pod's devices back to the host if no address arrives. The wait uses the larger of this and the time already spent attaching the Pod's devices in the same request, since returning them costs about as much.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 
 	flag.Usage = func() {
@@ -175,6 +182,14 @@ func main() {
 	defer store.Close()
 
 	opts = append(opts, driver.WithKubeletRootDir(kubeletRootDir))
+	if slaacReadyTimeout <= 0 {
+		klog.Fatalf("--slaac-ready-timeout must be positive, got %v", slaacReadyTimeout)
+	}
+	if slaacRollbackReserve <= 0 {
+		klog.Fatalf("--slaac-rollback-reserve must be positive, got %v", slaacRollbackReserve)
+	}
+	opts = append(opts, driver.WithSLAACReadyTimeout(slaacReadyTimeout))
+	opts = append(opts, driver.WithSLAACRollbackReserve(slaacRollbackReserve))
 
 	if celExpression != "" {
 		env, err := cel.NewEnv(
@@ -215,6 +230,15 @@ func main() {
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
 		inventory.WithMaxPollInterval(maxPollInterval),
 		inventory.WithMoveIBInterfaces(moveIBInterfaces),
+	}
+	if uplinkInterfaces != "" {
+		names := []string{}
+		for _, name := range strings.Split(uplinkInterfaces, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				names = append(names, name)
+			}
+		}
+		optsDb = append(optsDb, inventory.WithUplinkInterfaces(names))
 	}
 	if features.DefaultFeatureGate.Enabled(features.DRAListTypeAttributes) {
 		optsDb = append(optsDb, inventory.WithListNUMAAttributes())

@@ -457,6 +457,94 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "valid dadTransmits and routerSolicitationDelay",
+			cfg:       &InterfaceConfig{Name: "eth0", DADTransmits: ptr.To[int32](0), RouterSolicitationDelay: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "negative dadTransmits",
+			cfg:       &InterfaceConfig{Name: "eth0", DADTransmits: ptr.To[int32](-1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "negative routerSolicitationDelay",
+			cfg:       &InterfaceConfig{Name: "eth0", RouterSolicitationDelay: ptr.To[int32](-1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "IPv6 sysctls with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", DADTransmits: ptr.To[int32](0), RouterSolicitationDelay: ptr.To[int32](0), MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  2,
+		},
+		{
+			name:      "valid SLAAC addressing",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "SLAAC addressing with an explicit acceptRA",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "SLAAC addressing with an IPv6 address",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, Addresses: []string{"2001:db8::1/64"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			// IPv4 has no autoconfiguration for SLAAC to conflict with.
+			name:      "SLAAC addressing with an IPv4 address",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, Addresses: []string{"192.0.2.5/24"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "SLAAC addressing with an IPv4 and an IPv6 address",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, Addresses: []string{"192.0.2.5/24", "2001:db8::1/64"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "SLAAC addressing with acceptRA disabled",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "SLAAC addressing with the deprecated dhcp field",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, DHCP: ptr.To(true)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "SLAAC addressing with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "unsupported addressing mode",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingMode("Autoconf")},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",
@@ -633,6 +721,20 @@ func TestValidateSubinterfaceOnlyConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			// The sysctl helper runs on the IPVLAN path too, so the IPv6 timing
+			// settings apply to a child the same way acceptRA does.
+			name:      "dadTransmits is allowed",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", DADTransmits: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "routerSolicitationDelay is allowed",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", RouterSolicitationDelay: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
 			name:      "addressing dhcp is rejected",
 			cfg:       &InterfaceConfig{Type: "IPVLAN", Addressing: AddressingModeDHCP},
 			fieldPath: "iface",
@@ -746,6 +848,21 @@ func TestValidateRDMAOnlyConfigRejectsInterfaceSettings(t *testing.T) {
 			expectErr: true,
 			// A strict-unmarshal error would also count as an error, so pin the reason.
 			wantErr: "interface configuration is not supported",
+		},
+		{
+			name:      "dadTransmits is rejected",
+			raw:       `{"interface":{"dadTransmits":0}}`,
+			expectErr: true,
+		},
+		{
+			name:      "routerSolicitationDelay is rejected",
+			raw:       `{"interface":{"routerSolicitationDelay":0}}`,
+			expectErr: true,
+		},
+		{
+			name:      "SLAAC addressing is rejected",
+			raw:       `{"interface":{"addressing":"SLAAC"}}`,
+			expectErr: true,
 		},
 		{
 			name:      "type is rejected",

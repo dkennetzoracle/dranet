@@ -30,6 +30,9 @@ args: {}
 #  cloudProviderHint: ""
 #  profileProvider: "cloud"
 #  webhookURL: ""
+#  uplinkInterfaces: "eth0"
+#  slaacReadyTimeout: "1500ms"
+#  slaacRollbackReserve: "500ms"
 #  featureGates: ""
 
 # kubeletRootDir is the kubelet data directory (its --root-dir). The driver's

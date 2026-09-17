@@ -96,6 +96,16 @@ type InterfaceConfig struct {
 	// Moving the interface resets it to the destination namespace default, so it
 	// must be requested explicitly.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
+
+	// DADTransmits controls how many Duplicate Address Detection probes the
+	// interface sends for a new IPv6 address through
+	// /proc/sys/net/ipv6/conf/<iface>/dad_transmits.
+	DADTransmits *int32 `json:"dadTransmits,omitempty"`
+
+	// RouterSolicitationDelay controls how long the interface waits before
+	// sending its first Router Solicitation through
+	// /proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay, in seconds.
+	RouterSolicitationDelay *int32 `json:"routerSolicitationDelay,omitempty"`
 }
 ```
 
@@ -111,15 +121,19 @@ type InterfaceConfig struct {
 * **arpIgnore** (int32, optional): Which ARP requests the interface answers. Valid values are 0, 1, 2, 3, and 8. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_ignore`.
 * **arpAnnounce** (int32, optional): The source address the interface uses in ARP requests, from 0 to 2. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_announce`.
 * **acceptRA** (int32, optional): Whether the interface accepts IPv6 router advertisements. `0` rejects them, `1` accepts them when forwarding is off, and `2` accepts them also when forwarding is on. Sets `/proc/sys/net/ipv6/conf/<iface>/accept_ra`.
+* **dadTransmits** (int32, optional): How many Duplicate Address Detection probes the interface sends for a new IPv6 address. Sets `/proc/sys/net/ipv6/conf/<iface>/dad_transmits`.
+* **routerSolicitationDelay** (int32, optional): How many seconds the interface waits before sending its first Router Solicitation. Sets `/proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay`.
+* **addressing** (string, optional): How the interface gets its addresses: `Static` (the default, from `addresses` or a provider profile), `DHCP`, `SLAAC`, or `Unnumbered` (subinterfaces only). See [IPv6 autoconfiguration](#ipv6-autoconfiguration-slaac).
 
 The kernel resets both ARP settings to the network namespace default when an interface
 moves into a Pod, so a value configured on the host does not survive the move and has to
 be requested here. The kernel resets `accept_ra` the same way when the interface moves.
 The kernel creates IPv6 settings only for an interface with an MTU of 1280 or more.
-A claim with `acceptRA` is rejected when its `mtu` is below 1280, or when it sets no `mtu`
-and the interface would keep a smaller MTU from the host. The check runs before the interface
-is touched. When the interface has no `accept_ra` sysctl, for example on a node that boots
-with `ipv6.disable=1`, `acceptRA: 0` is already satisfied, and `1` or `2` fail with an error
+A claim with `acceptRA`, `dadTransmits`, `routerSolicitationDelay` or `addressing: SLAAC`
+is rejected when its `mtu` is below 1280, or when it sets no `mtu` and the interface would
+keep a smaller MTU from the host. The check runs before the interface is touched. When the
+interface has no `accept_ra` sysctl, for example on a node that boots with
+`ipv6.disable=1`, `acceptRA: 0` is already satisfied, and `1` or `2` fail with an error
 that says so.
 Setups that attach several interfaces sharing one IP subnet, such as
 multi-NIC RDMA nodes, typically need `arpIgnore: 1` and `arpAnnounce: 2`. Without them an
@@ -164,6 +178,95 @@ Two settings are not supported for subinterfaces and are rejected by validation:
 * `hardwareAddr`: the child always uses the parent MAC address.
 * DHCP addressing: unsupported and untested. The DHCP client runs on the host parent
   interface before the subinterface exists.
+
+#### IPv6 autoconfiguration (SLAAC)
+
+On fabrics where the routers hand out IPv6 prefixes, the host interfaces get their
+addresses and default routes from Router Advertisements rather than from any
+configuration DRANET can read off the node:
+
+```
+rdma0  inet6 fdcd:8200:cde5:20b7:a20:e7ff:fe96:708/64 dynamic mngtmpaddr proto kernel_ra
+default via fe80::b061:4eff:fe0c:d0b7 dev rdma0 proto ra metric 1024 expires 1536sec
+```
+
+By default DRANET copies the host's addresses into the Pod as static ones. That works,
+but the copy has no lifetimes and no relationship to the advertisement that produced it.
+`addressing: SLAAC` instead lets the Pod autoconfigure itself:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: rdma-slaac
+spec:
+  devices:
+    requests:
+    - name: rdma
+      exactly:
+        deviceClassName: dra.net
+    config:
+    - requests: ["rdma"]
+      opaque:
+        driver: dra.net
+        parameters:
+          interface:
+            addressing: SLAAC
+            arpIgnore: 1
+            arpAnnounce: 2
+```
+
+With `addressing: SLAAC` DRANET:
+
+* inherits no IPv6 addresses from the host, and leaves out the host routes the Pod will
+  re-learn from advertisements (`proto ra`). IPv4 has no autoconfiguration to defer to,
+  so a dual-stack interface still inherits its IPv4 addresses, or takes IPv4 `addresses`
+  from the claim, as any passthrough interface does;
+* defaults `acceptRA: 2`, `dadTransmits: 0` and `routerSolicitationDelay: 0`, all of
+  which you can override. The kernel resets these when the interface moves, so they have
+  to be requested; the last two are what bring address acquisition down from a couple of
+  seconds to a few milliseconds, which is what makes it fit the runtime's deadline;
+* waits, after bringing the interface up inside the Pod, for a global unicast IPv6
+  address that has finished duplicate address detection, and records it in the
+  ResourceClaim's `status.devices[].networkData.ips` along with a `SLAACReady` condition.
+
+DRANET attaches and configures all of the Pod's devices first and checks autoconfiguration
+afterwards. By then all but the last interface usually have their address already, and a
+failure has one place to roll everything back from: every device the request attached
+goes back to the host, under its original name, and the sandbox fails, so the kubelet
+retries rather than starting a workload on an interface with no source address.
+
+The wait is bounded by `--slaac-ready-timeout` (1.5s by default) and by the deadline of
+the runtime request that triggered it, minus a reserve for that rollback. The reserve is
+the larger of `--slaac-rollback-reserve` (500ms by default) and the time the request has
+already spent attaching the Pod's devices, because returning them costs about as much.
+
+Attaching several NICs one at a time can outrun the runtime's timeout for a plugin
+request, 2s in both containerd and CRI-O, so the check looks at how much of that request is
+left. With more than the reserve remaining it waits for the smaller of the two and rolls
+back on timeout. With the reserve or less remaining there is time to roll back but not to
+wait, so it checks once, rolls back, and the kubelet retries. Only once the deadline has
+actually passed does it log a warning and finish the wait on `--slaac-ready-timeout`
+instead: the runtime is no longer waiting for the request, so an error would not fail the
+sandbox and taking the interface back would only leave the Pod without a NIC it is about to
+use. A rollback still happens if that wait itself fails.
+
+A failed wait is also recorded on the ResourceClaim, as a `SLAACReady` condition with
+status `False` and the reason the interface was not ready, next to the Pod's
+`NetworkDeviceNotReady` event.
+
+Whichever way a passthrough interface comes back to the host, rolled back or returned when
+the Pod ends, DRANET puts back what the move dropped: the master it was enslaved to (a VRF
+slave goes back into its VRF), its MTU, and brings it up. When the Pod's network namespace
+is already gone by the time the runtime calls DRANET, the kernel has handed the interface
+back on its own, down and renamed if its name was taken; DRANET finds it by name or by PCI
+address and restores it the same way.
+
+`SLAAC` requires a passthrough interface: only that path waits for the autoconfigured
+address and rolls the interface back if none arrives. It cannot be combined with IPv6
+`addresses` or with `acceptRA: 0`. A `vrf` is fine: enslaving the interface cycles its
+link and drops the address it had, so the wait runs after that and reports the address
+that survives it.
 
 #### Route Configuration (RouteConfig)
 
