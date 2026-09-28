@@ -167,11 +167,11 @@ func (e *ipvlanTestEnv) linkAttrs(t *testing.T, name string) *netlink.LinkAttrs 
 	return link.Attrs()
 }
 
-func assertOnlyLoopback(t *testing.T, env *ipvlanTestEnv) {
+func assertLinkAbsent(t *testing.T, env *ipvlanTestEnv, name string) {
 	t.Helper()
 	names := env.linkNames(t)
-	if len(names) != 1 || names[0] != "lo" {
-		t.Errorf("expected only lo in the test namespace after the failure, got %v", names)
+	if slices.Contains(names, name) {
+		t.Errorf("interface %s is still in the test namespace after the failure; links: %v", name, names)
 	}
 }
 
@@ -293,7 +293,7 @@ func testSubinterface_IPVlan_Namespaced(t *testing.T) {
 	if err := nsDeleteSubinterface(env.nsPath, config.Name); err != nil {
 		t.Fatalf("fail to delete subinterface: %v", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinkAbsent(t, env, config.Name)
 }
 
 func TestSubinterface_IPVlanMTU(t *testing.T) {
@@ -345,7 +345,7 @@ func testSubinterface_IPVlanRejectsMTUAboveParent_Namespaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exceeds parent interface") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want a parent MTU error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinkAbsent(t, env, config.Name)
 }
 
 func TestSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU(t *testing.T) {
@@ -374,7 +374,7 @@ func testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinkAbsent(t, env, config.Name)
 	parent, err = nlwrap.LinkByName(env.parent)
 	if err != nil {
 		t.Fatal(err)
@@ -410,7 +410,7 @@ func testSubinterface_IPVlanRollsBackOnSysctlFailure_Namespaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "arp_ignore") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want an arp_ignore apply error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinkAbsent(t, env, config.Name)
 }
 
 func TestSubinterface_IPVlanRollsBackOnNameCollision(t *testing.T) {
@@ -441,11 +441,12 @@ func testSubinterface_IPVlanRollsBackOnNameCollision_Namespaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "failed to rename interface") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want a rename error", err)
 	}
-	// Only lo and the pre-existing dummy remain, and the dummy is untouched.
+	// The pre-existing collision and loopback remain; kernel-managed links may also appear.
 	names := env.linkNames(t)
-	slices.Sort(names)
-	if want := []string{config.Name, "lo"}; !slices.Equal(names, want) {
-		t.Errorf("links after the rename failure = %v, want %v", names, want)
+	for _, want := range []string{config.Name, "lo"} {
+		if !slices.Contains(names, want) {
+			t.Errorf("links after the rename failure = %v, want %s to remain", names, want)
+		}
 	}
 	existing, err := nhNs.LinkByName(config.Name)
 	if err != nil {
@@ -483,8 +484,43 @@ func testCreateSubinterfaceInNS_RollsBackOnConfigureFailure_Namespaced(t *testin
 	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
 		t.Fatalf("createSubinterfaceInNS() error = %v, want a routes configuration error", err)
 	}
-	assertOnlyLoopback(t, env)
+	assertLinkAbsent(t, env, deviceCfg.NetworkInterfaceConfigInPod.Interface.Name)
 	// A failed configuration must not report the device.
+	if len(status.Conditions) != 0 || status.NetworkData != nil {
+		t.Errorf("status after a configuration failure has %d conditions and network data %v, want none", len(status.Conditions), status.NetworkData)
+	}
+}
+
+func TestAttachNetdevToNS_RollsBackOnConfigureFailure(t *testing.T) {
+	userns.Run(t, testAttachNetdevToNS_RollsBackOnConfigureFailure_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testAttachNetdevToNS_RollsBackOnConfigureFailure_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, 1400)
+	deviceCfg := DeviceConfig{
+		Claim: types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: env.parent},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Name:      "dranet0",
+				Addresses: []string{"192.0.2.10/24"},
+			},
+			// The gateway is not on link, so the route cannot be applied.
+			Routes: []apis.RouteConfig{{Destination: "198.51.100.0/24", Gateway: "203.0.113.1"}},
+		},
+	}
+
+	status := resourceapply.AllocatedDeviceStatus()
+	err := attachNetdevToNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
+	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
+		t.Fatalf("attachNetdevToNS() error = %v, want a routes configuration error", err)
+	}
+	assertLinkAbsent(t, env, deviceCfg.NetworkInterfaceConfigInPod.Interface.Name)
+	if _, err := nlwrap.LinkByName(env.parent); err != nil {
+		t.Errorf("expected interface %s to be returned to the host namespace: %v", env.parent, err)
+	}
 	if len(status.Conditions) != 0 || status.NetworkData != nil {
 		t.Errorf("status after a configuration failure has %d conditions and network data %v, want none", len(status.Conditions), status.NetworkData)
 	}
