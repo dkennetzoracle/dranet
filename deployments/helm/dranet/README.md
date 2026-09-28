@@ -46,6 +46,7 @@ The following table lists the configurable parameters and their default values:
 | `args.cloudProviderHint` | Hint for the cloud provider plugin (`GCE`, `AZURE`, `OKE`, `AWS`, `ALIBABA`, `CKS`, `webhook`, `NONE`); auto-detected if unset | binary default: `""` |
 | `args.profileProvider` | Provider for user profile configuration (`cloud`, `webhook`, `none`) | binary default: `cloud` |
 | `args.webhookURL` | HTTP, HTTPS, or Unix socket URL; required when either provider uses `webhook` | binary default: `""` |
+| `args.uplinkInterfaces` | Comma-separated host uplink interfaces to keep out of the inventory, along with their children, instead of detecting them from the default routes; names absent on a node are ignored, so one list can cover several node shapes | binary default: `""` (detect) |
 | `args.featureGates` | Comma-separated feature gate settings in `key=value` format | binary default: `""` |
 
 > **Note:** All `args.*` fields are optional. When omitted, the flag is not passed to the binary and the binary's built-in default applies.
