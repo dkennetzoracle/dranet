@@ -371,7 +371,7 @@ func testSubinterface_IPVlanRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T)
 	}
 
 	_, err = nsCreateSubinterface(env.parent, env.nsPath, config)
-	if err == nil || !strings.Contains(err.Error(), "acceptRA requires an MTU of at least 1280") {
+	if err == nil || !strings.Contains(err.Error(), "require an MTU of at least 1280") {
 		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
 	}
 	assertLinkAbsent(t, env, config.Name)
