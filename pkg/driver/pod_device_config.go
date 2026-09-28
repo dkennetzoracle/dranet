@@ -69,9 +69,31 @@ type DeviceConfig struct {
 	// with the rest of the device config so a daemon restart mid-claim keeps it.
 	NetworkInterfaceStateInPod *NetworkInterfaceState `json:"networkInterfaceStateInPod,omitempty"`
 
+	// NetworkInterfaceStateInHost is what a passthrough interface looked like
+	// on the host before it moved into the Pod, recorded at prepare time so
+	// that every path that returns it can put it back the same way. Only set
+	// for interfaces that move; subinterfaces leave the host untouched.
+	NetworkInterfaceStateInHost *HostLinkState `json:"networkInterfaceStateInHost,omitempty"`
+
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+}
+
+// HostLinkState is the host-side state a namespace move drops. The kernel
+// unlinks an interface from its master when it leaves the namespace, so a VRF
+// slave would otherwise come back outside its VRF; the Pod configuration may
+// change the MTU; and when the namespace is destroyed before DraNet returns
+// the interface, the kernel hands it back down and renames it if its name is
+// taken, so the PCI address is what finds it again.
+type HostLinkState struct {
+	// Master is the name of the device the interface was enslaved to on the
+	// host, a VRF, bond or bridge; empty when it had none.
+	Master string `json:"master,omitempty"`
+	// MTU is the interface's MTU on the host.
+	MTU int `json:"mtu,omitempty"`
+	// PCIAddress is the PCI function behind the interface, when it has one.
+	PCIAddress string `json:"pciAddress,omitempty"`
 }
 
 // NetworkInterfaceState is the driver-recorded runtime counterpart of an

@@ -133,6 +133,19 @@ values from the initial network namespace, subject to `net.core.devconf_inherit_
 The IPv6 values start at the kernel defaults (`accept_ra` is 1) unless that sysctl is 1 or 3.
 DRANET only changes the per-interface value.
 
+##### Returning a passthrough interface to the host
+
+A `Passthrough` interface leaves the host when the Pod starts and comes back when the Pod
+ends, or at once if the sandbox fails to start after the interface was already moved. The
+kernel drops two things on the way: the interface is unlinked from its master, so a VRF
+slave would come back outside its VRF, and it comes back down. DRANET records the master,
+MTU and PCI address of the interface before the move and restores them whichever way the
+interface comes back: on the normal return when the Pod ends, on the rollback of a failed
+sandbox, and when the Pod's network namespace is already gone by the time the runtime calls
+DRANET. In that last case the kernel has handed the interface back on its own, down and
+renamed if its name was taken meanwhile; DRANET finds it by name or through its PCI
+function, renames it back, restores its master and MTU and brings it up.
+
 ##### IPVLAN subinterfaces
 
 An `IPVLAN` subinterface is created inside the Pod network namespace on top of the

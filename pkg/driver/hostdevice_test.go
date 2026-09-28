@@ -212,7 +212,7 @@ func test_nhNetdev_Namespaced(t *testing.T) {
 		}
 	}()
 
-	err = nsDetachNetdev(containerNsPath, config.Name, ifaceName)
+	err = nsDetachNetdev(containerNsPath, config.Name, ifaceName, nil)
 	if err != nil {
 		t.Fatalf("failed to detach netdev from namespace: %v", err)
 	}
@@ -431,7 +431,7 @@ func test_nsDetachNetdevFromNSUsesOpenNamespace_Namespaced(t *testing.T) {
 	if err := netns.DeleteNamed(nsName); err != nil {
 		t.Fatalf("failed to remove network namespace path: %v", err)
 	}
-	if err := nsDetachNetdevFromNS(targetNs, containerNsPath, "dranet0", ifaceName); err != nil {
+	if err := nsDetachNetdevFromNS(targetNs, containerNsPath, "dranet0", ifaceName, nil); err != nil {
 		t.Fatalf("failed to detach with open namespace handle: %v", err)
 	}
 

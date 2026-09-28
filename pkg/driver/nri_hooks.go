@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -211,7 +212,7 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			} else {
 				ifNameInNs, err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice)
 				if ifNameInNs != "" {
-					attached = append(attached, attachedDevice{deviceName: deviceName, hostIfName: ifName, ifNameInNs: ifNameInNs})
+					attached = append(attached, attachedDevice{deviceName: deviceName, hostIfName: ifName, ifNameInNs: ifNameInNs, hostState: config.NetworkInterfaceStateInHost})
 				}
 				if err != nil {
 					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
@@ -309,6 +310,9 @@ type attachedDevice struct {
 	// rdmaLinkDev is the RDMA device moved into the namespace, in exclusive
 	// RDMA netns mode only.
 	rdmaLinkDev string
+	// hostState is what the moved netdev looked like on the host, to restore
+	// on the way back.
+	hostState *HostLinkState
 }
 
 // rollbackAttachedDevices returns to the host everything a RunPodSandbox
@@ -335,7 +339,7 @@ func rollbackAttachedDevices(ctx context.Context, ns string, attached []attached
 				errs = append(errs, fmt.Errorf("failed to delete subinterface %s of %s: %w", dev.ifNameInNs, dev.deviceName, err))
 			}
 		case dev.hostIfName != "":
-			if err := nsDetachNetdev(ns, dev.ifNameInNs, dev.hostIfName); err != nil {
+			if err := nsDetachNetdev(ns, dev.ifNameInNs, dev.hostIfName, dev.hostState); err != nil {
 				errs = append(errs, fmt.Errorf("failed to return interface %s of %s to the host as %s: %w", dev.ifNameInNs, dev.deviceName, dev.hostIfName, err))
 			}
 		}
@@ -362,12 +366,18 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
+		// The interface is on the host either way, down: the move sets it
+		// down first and a failure before or after it leaves it so. Put it
+		// back the way it was so the kubelet's retry starts from a clean host.
+		if _, restoreErr := returnHostLink(ifName, config.NetworkInterfaceStateInHost); restoreErr != nil {
+			logger.Error(restoreErr, "RunPodSandbox could not fully restore the network device on the host after the failed move")
+		}
 		return "", fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
 	}
 
 	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
 	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
-		if detachErr := nsDetachNetdev(ns, networkData.InterfaceName, ifName); detachErr != nil {
+		if detachErr := nsDetachNetdev(ns, networkData.InterfaceName, ifName, config.NetworkInterfaceStateInHost); detachErr != nil {
 			return networkData.InterfaceName, errors.Join(err, fmt.Errorf("failed to return network device %s after a configuration failure: %w", deviceName, detachErr))
 		}
 		return "", err
@@ -533,8 +543,7 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		// we workaround it using the local copy we have in the db to associate interfaces with Pods via
 		// the network namespace id.
 		if podConfig.NetNS == "" {
-			logger.Info("StopPodSandbox: network namespace for DRANET pod is unknown; skipping explicit device detach and relying on kernel netns teardown")
-			return nil
+			logger.Info("StopPodSandbox: network namespace for DRANET pod is unknown; relying on kernel netns teardown to return the devices and restoring them on the host")
 		}
 		ns = podConfig.NetNS
 	}
@@ -559,14 +568,37 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		if ifName != "" {
 			if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
 				subIfName := config.NetworkInterfaceConfigInPod.Interface.Name
-				if err := nsDeleteSubinterface(ns, subIfName); err != nil {
+				if ns == "" {
+					// Nothing to do: the child died with its namespace.
+				} else if err := nsDeleteSubinterface(ns, subIfName); err != nil {
 					logger.Error(err, "Failed to delete subinterface", "subInterface", subIfName, "device", deviceName)
 				}
 			} else {
-				if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
-					logger.Error(err, "Failed to return network device", "device", deviceName)
-				} else {
+				hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
+				var err error
+				if ns != "" {
+					err = nsDetachNetdev(ns, ifName, hostIfName, config.NetworkInterfaceStateInHost)
+				}
+				switch {
+				case ns != "" && err == nil:
 					netdevDetached = true
+				case ns == "" || errors.Is(err, fs.ErrNotExist):
+					// The namespace is already gone, so the kernel has returned,
+					// or is returning, the interface on its own: down, without
+					// its host settings, renamed if the name was taken. Find it
+					// and put it back the way it was.
+					found, restoreErr := returnHostLinkWithRetry(hostIfName, config.NetworkInterfaceStateInHost)
+					switch {
+					case restoreErr != nil:
+						logger.Error(restoreErr, "Failed to restore the network device on the host after its namespace was torn down", "device", deviceName, "interface", hostIfName)
+					case !found:
+						logger.Info("Network device has not come back to the host yet after its namespace was torn down; leaving it to the kernel", "device", deviceName, "interface", hostIfName)
+					default:
+						logger.V(2).Info("Restored the network device on the host after its namespace was torn down", "device", deviceName, "interface", hostIfName)
+						netdevDetached = true
+					}
+				default:
+					logger.Error(err, "Failed to return network device", "device", deviceName)
 				}
 			}
 		}
@@ -579,6 +611,21 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		np.netdb.RequestRescan()
 	}
 	return nil
+}
+
+// returnHostLinkWithRetry gives the kernel a moment to finish handing an
+// interface back after its namespace is destroyed, which happens just before
+// the runtime calls StopPodSandbox, then restores it. It is bounded well
+// inside the runtime's budget for the hook.
+func returnHostLinkWithRetry(hostIfName string, state *HostLinkState) (bool, error) {
+	const attempts, interval = 10, 50 * time.Millisecond
+	for i := 0; ; i++ {
+		found, err := returnHostLink(hostIfName, state)
+		if found || err != nil || i == attempts-1 {
+			return found, err
+		}
+		time.Sleep(interval)
+	}
 }
 
 // needsRescanAfterDetach reports whether the inventory needs an explicit

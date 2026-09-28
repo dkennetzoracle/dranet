@@ -1899,9 +1899,22 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 				}
 			}
 
-			opts := []cmp.Option{cmpopts.EquateEmpty(), cmpopts.IgnoreFields(PodConfig{}, "LastNRIActivity")}
+			// The host state is read off the live dummy interface, so it is checked
+			// for shape rather than listed in every expected config.
+			opts := []cmp.Option{cmpopts.EquateEmpty(), cmpopts.IgnoreFields(PodConfig{}, "LastNRIActivity"), cmpopts.IgnoreFields(DeviceConfig{}, "NetworkInterfaceStateInHost")}
 			if diff := cmp.Diff(tc.wantPodConfig, gotPodConfig, opts...); diff != "" {
 				t.Errorf("PodConfig mismatch (-want +got):\n%s", diff)
+			}
+			if gotPodConfig != nil {
+				for name, cfg := range gotPodConfig.DeviceConfigs {
+					moves := cfg.NetworkInterfaceConfigInHost.Interface.Name != "" && !cfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface()
+					switch {
+					case moves && (cfg.NetworkInterfaceStateInHost == nil || cfg.NetworkInterfaceStateInHost.MTU <= 0):
+						t.Errorf("device %s moves into the Pod but its host state was not recorded: %+v", name, cfg.NetworkInterfaceStateInHost)
+					case !moves && cfg.NetworkInterfaceStateInHost != nil:
+						t.Errorf("device %s does not move into the Pod but has host state %+v", name, cfg.NetworkInterfaceStateInHost)
+					}
+				}
 			}
 			if tc.check != nil {
 				tc.check(t, fakeDB)

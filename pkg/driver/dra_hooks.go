@@ -338,6 +338,11 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		return fmt.Errorf("failed to get netlink to interface %s: %v", ifName, err)
 	}
 	deviceCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
+	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
+		// The interface is about to leave the host. Remember what it looked
+		// like so it can come back the same way, by any of the return paths.
+		deviceCfg.NetworkInterfaceStateInHost = hostLinkState(link, deviceSnapshot)
+	}
 
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 		// If the interface name was not explicitly overridden, use the same
@@ -677,6 +682,27 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 		}
 	}
 	return rulesByTable, nil
+}
+
+// hostLinkState records the host-side state of a passthrough interface that a
+// namespace move drops, so the detach paths can restore it: its master, its
+// MTU, and the PCI address that finds it again should the kernel return it
+// under another name.
+func hostLinkState(link netlink.Link, device *resourceapi.Device) *HostLinkState {
+	state := &HostLinkState{MTU: link.Attrs().MTU}
+	if index := link.Attrs().MasterIndex; index != 0 {
+		if master, err := netlink.LinkByIndex(index); err == nil {
+			state.Master = master.Attrs().Name
+		} else {
+			klog.Warningf("interface %s is enslaved to link index %d, which could not be resolved; it will come back to the host without its master: %v", link.Attrs().Name, index, err)
+		}
+	}
+	if device != nil {
+		if attr, ok := device.Attributes[resourceapi.QualifiedName(apis.AttrPCIAddress)]; ok && attr.StringValue != nil {
+			state.PCIAddress = *attr.StringValue
+		}
+	}
+	return state
 }
 
 // getRouteInfo retrieves all routes associated with a given network interface.
