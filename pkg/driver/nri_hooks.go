@@ -157,6 +157,27 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
+
+	// Everything this request puts into the namespace, so that a failure part
+	// way through returns all of it instead of leaving the earlier devices
+	// behind in a namespace the runtime is about to tear down.
+	var attached []attachedDevice
+	fail := func(cause error) error {
+		if len(attached) == 0 {
+			return cause
+		}
+		start := time.Now()
+		rescan, rollbackErr := rollbackAttachedDevices(ctx, ns, attached, np.rdmaSharedMode)
+		if rescan {
+			np.netdb.RequestRescan()
+		}
+		logger.Info("Returned the devices attached by this request to the host", "devices", len(attached), "duration", time.Since(start).Round(time.Millisecond))
+		if rollbackErr != nil {
+			return errors.Join(cause, rollbackErr)
+		}
+		return cause
+	}
+
 	// Process the configurations of the ResourceClaim
 	for deviceName, config := range podConfig.DeviceConfigs {
 		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
@@ -178,15 +199,25 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 		// Block 1: netdev operations — only when a network interface is present.
 		if ifName != "" {
 			if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-				if err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+				ifNameInNs, err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice)
+				if ifNameInNs != "" {
+					attached = append(attached, attachedDevice{deviceName: deviceName, ifNameInNs: ifNameInNs, subinterface: true})
+				}
+				if err != nil {
 					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
 						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
-					return err
+					return fail(err)
 				}
-			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
-				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
-					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
-				return err
+			} else {
+				ifNameInNs, err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice)
+				if ifNameInNs != "" {
+					attached = append(attached, attachedDevice{deviceName: deviceName, hostIfName: ifName, ifNameInNs: ifNameInNs})
+				}
+				if err != nil {
+					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
+						"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
+					return fail(err)
+				}
 			}
 		}
 
@@ -197,8 +228,9 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			if err := attachRdmaToNS(ctx, config.RDMADevice.LinkDev, ns, resourceClaimStatusDevice); err != nil {
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "RDMADeviceAttachFailed",
 					"failed to attach RDMA device %s to pod %s/%s: %v", config.RDMADevice.LinkDev, pod.GetNamespace(), pod.GetName(), err)
-				return err
+				return fail(err)
 			}
+			attached = append(attached, attachedDevice{deviceName: deviceName, rdmaLinkDev: config.RDMADevice.LinkDev})
 		}
 
 		// Block 3: Status conditions for IB-only devices (no netdev).
@@ -258,10 +290,70 @@ func attachRdmaToNS(ctx context.Context, linkDev, ns string, resourceClaimStatus
 	return nil
 }
 
+// attachedDevice is a device the current RunPodSandbox request has moved into,
+// or created in, the Pod network namespace. A failure later in the same request
+// returns all of them so the kubelet's retry starts from a clean host; the
+// runtime does not call StopPodSandbox for a sandbox that failed to start, and
+// the kernel would otherwise hand the devices back on its own terms when it
+// destroys the namespace: down, renamed if the name is taken, and without the
+// settings they had on the host.
+type attachedDevice struct {
+	deviceName string
+	// hostIfName is the name a moved netdev has to get back; empty when the
+	// device brought no netdev into the namespace.
+	hostIfName string
+	// ifNameInNs is the netdev's name inside the namespace, or the name of the
+	// subinterface created there.
+	ifNameInNs   string
+	subinterface bool
+	// rdmaLinkDev is the RDMA device moved into the namespace, in exclusive
+	// RDMA netns mode only.
+	rdmaLinkDev string
+}
+
+// rollbackAttachedDevices returns to the host everything a RunPodSandbox
+// request has put into the Pod namespace, most recent first, and reports
+// whether the inventory needs a rescan: returning an RDMA device produces no
+// netlink event the inventory would notice on its own.
+func rollbackAttachedDevices(ctx context.Context, ns string, attached []attachedDevice, rdmaSharedMode bool) (bool, error) {
+	logger := klog.FromContext(ctx)
+	var errs []error
+	needsRescan := false
+	for i := len(attached) - 1; i >= 0; i-- {
+		dev := attached[i]
+		// RDMA before the netdev, for the reason given in stopPodSandbox.
+		if !rdmaSharedMode && dev.rdmaLinkDev != "" {
+			if err := nsDetachRdmadev(ns, dev.rdmaLinkDev); err != nil {
+				errs = append(errs, fmt.Errorf("failed to return RDMA device %s of %s to the host: %w", dev.rdmaLinkDev, dev.deviceName, err))
+			} else {
+				needsRescan = true
+			}
+		}
+		switch {
+		case dev.subinterface && dev.ifNameInNs != "":
+			if err := nsDeleteSubinterface(ns, dev.ifNameInNs); err != nil {
+				errs = append(errs, fmt.Errorf("failed to delete subinterface %s of %s: %w", dev.ifNameInNs, dev.deviceName, err))
+			}
+		case dev.hostIfName != "":
+			if err := nsDetachNetdev(ns, dev.ifNameInNs, dev.hostIfName); err != nil {
+				errs = append(errs, fmt.Errorf("failed to return interface %s of %s to the host as %s: %w", dev.ifNameInNs, dev.deviceName, dev.hostIfName, err))
+			}
+		}
+		logger.V(2).Info("Returned device to the host after a failed RunPodSandbox", "device", dev.deviceName)
+	}
+	return needsRescan, errors.Join(errs...)
+}
+
 // attachNetdevToNS moves the host network interface into the pod network namespace,
 // applies all associated configuration (ethtool, eBPF, routes, rules, neighbors),
 // and records the resulting status conditions on resourceClaimStatusDevice.
-func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+//
+// It returns the interface's name inside the namespace whenever the interface
+// is still there on return, with or without an error, so the caller knows what
+// to return to the host if the request fails after this point. An empty name
+// means the interface is on the host: either it never moved, or its own
+// configuration failed and it was returned here already.
+func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) (string, error) {
 	ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger := klog.LoggerWithValues(klog.FromContext(ctx), "device", deviceName, "interface", ifName, "netns", ns)
 	logger.V(2).Info("RunPodSandbox processing Network device")
@@ -270,15 +362,15 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
-		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
+		return "", fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
 	}
 
 	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
 	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
 		if detachErr := nsDetachNetdev(ns, networkData.InterfaceName, ifName); detachErr != nil {
-			return errors.Join(err, fmt.Errorf("failed to return network device %s after a configuration failure: %w", deviceName, detachErr))
+			return networkData.InterfaceName, errors.Join(err, fmt.Errorf("failed to return network device %s after a configuration failure: %w", deviceName, detachErr))
 		}
-		return err
+		return "", err
 	}
 
 	resourceClaimStatusDevice.WithConditions(
@@ -292,12 +384,16 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 		WithHardwareAddress(networkData.HardwareAddress).
 		WithIPs(networkData.IPs...),
 	) // End of WithNetworkData
-	return nil
+	return networkData.InterfaceName, nil
 }
 
 // createSubinterfaceInNS creates a subinterface in the pod network namespace,
 // applies all associated configurations, and records the status conditions.
-func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+//
+// It returns the subinterface's name whenever the subinterface still exists on
+// return, so the caller can delete it if the request fails later; a
+// configuration failure deletes it here already and returns an empty name.
+func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) (string, error) {
 	logger := klog.FromContext(ctx)
 	hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger.V(2).Info("RunPodSandbox creating subinterface on parent device", "parentDevice", hostIfName)
@@ -305,16 +401,16 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 	networkData, err := nsCreateSubinterface(hostIfName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error creating subinterface", "parentDevice", hostIfName, "netns", ns)
-		return fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
+		return "", fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
 	}
 
 	// Configure the subinterface (ethtool, vrf, routes, neighbors, rules)
 	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
 		// Delete the child now rather than leaving it half configured until pod teardown.
 		if delErr := nsDeleteSubinterface(ns, networkData.InterfaceName); delErr != nil {
-			return errors.Join(err, fmt.Errorf("failed to delete subinterface %s after a configuration failure: %w", networkData.InterfaceName, delErr))
+			return networkData.InterfaceName, errors.Join(err, fmt.Errorf("failed to delete subinterface %s after a configuration failure: %w", networkData.InterfaceName, delErr))
 		}
-		return err
+		return "", err
 	}
 
 	// Report the device only after the configuration succeeds, so a failure
@@ -330,7 +426,7 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 		WithHardwareAddress(networkData.HardwareAddress).
 		WithIPs(networkData.IPs...),
 	)
-	return nil
+	return networkData.InterfaceName, nil
 }
 
 // configureNetdevInNS applies common L3 configurations (ethtool, eBPF, VRF, routes, rules, and neighbors)

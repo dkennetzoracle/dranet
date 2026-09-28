@@ -480,7 +480,7 @@ func testCreateSubinterfaceInNS_RollsBackOnConfigureFailure_Namespaced(t *testin
 	}
 
 	status := resourceapply.AllocatedDeviceStatus()
-	err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
+	_, err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
 	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
 		t.Fatalf("createSubinterfaceInNS() error = %v, want a routes configuration error", err)
 	}
@@ -513,7 +513,7 @@ func testAttachNetdevToNS_RollsBackOnConfigureFailure_Namespaced(t *testing.T) {
 	}
 
 	status := resourceapply.AllocatedDeviceStatus()
-	err := attachNetdevToNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
+	_, err := attachNetdevToNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status)
 	if err == nil || !strings.Contains(err.Error(), "error configuring device net-dev-0 routes") {
 		t.Fatalf("attachNetdevToNS() error = %v, want a routes configuration error", err)
 	}
@@ -549,7 +549,7 @@ func testCreateSubinterfaceInNS_ReportsStatusOnSuccess_Namespaced(t *testing.T) 
 	}
 
 	status := resourceapply.AllocatedDeviceStatus()
-	if err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status); err != nil {
+	if _, err := createSubinterfaceInNS(context.Background(), env.nsPath, "net-dev-0", deviceCfg, status); err != nil {
 		t.Fatalf("createSubinterfaceInNS() error = %v", err)
 	}
 
