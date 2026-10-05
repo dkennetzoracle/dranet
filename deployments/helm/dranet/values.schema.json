@@ -21,7 +21,11 @@
         },
         "pullPolicy": {
           "type": "string",
-          "enum": ["Always", "IfNotPresent", "Never"]
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
         }
       }
     },
@@ -44,7 +48,10 @@
       "type": "object"
     },
     "metricsPort": {
-      "type": ["integer", "null"],
+      "type": [
+        "integer",
+        "null"
+      ],
       "minimum": 1,
       "maximum": 65535
     },
@@ -126,7 +133,16 @@
         },
         "cloudProviderHint": {
           "type": "string",
-          "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "CKS", "webhook", "NONE"],
+          "enum": [
+            "GCE",
+            "AZURE",
+            "OKE",
+            "AWS",
+            "ALIBABA",
+            "CKS",
+            "webhook",
+            "NONE"
+          ],
           "description": "Hint for the cloud provider plugin; auto-detected if unset"
         },
         "cloudProviderOptions": {
@@ -148,7 +164,11 @@
         },
         "profileProvider": {
           "type": "string",
-          "enum": ["cloud", "webhook", "none"],
+          "enum": [
+            "cloud",
+            "webhook",
+            "none"
+          ],
           "description": "Provider for user profile configuration"
         },
         "webhookURL": {
@@ -158,6 +178,16 @@
         "featureGates": {
           "type": "string",
           "description": "Comma-separated feature gate settings in key=value format"
+        },
+        "slaacReadyTimeout": {
+          "type": "string",
+          "description": "How long to wait for an interface using addressing: SLAAC to pick up an address from IPv6 router advertisements inside the Pod, for example 1500ms.",
+          "pattern": "^[0-9]+(ns|us|ms|s|m|h)$"
+        },
+        "slaacRollbackReserve": {
+          "type": "string",
+          "description": "The least time a SLAAC wait leaves of the container runtime's request for returning the Pod's devices to the host, for example 500ms.",
+          "pattern": "^[0-9]+(ns|us|ms|s|m|h)$"
         }
       },
       "allOf": [
@@ -168,7 +198,9 @@
                 "const": "webhook"
               }
             },
-            "required": ["cloudProviderHint"]
+            "required": [
+              "cloudProviderHint"
+            ]
           },
           "then": {
             "properties": {
@@ -176,7 +208,9 @@
                 "minLength": 1
               }
             },
-            "required": ["webhookURL"]
+            "required": [
+              "webhookURL"
+            ]
           }
         },
         {
@@ -186,7 +220,9 @@
                 "const": "webhook"
               }
             },
-            "required": ["profileProvider"]
+            "required": [
+              "profileProvider"
+            ]
           },
           "then": {
             "properties": {
@@ -194,7 +230,9 @@
                 "minLength": 1
               }
             },
-            "required": ["webhookURL"]
+            "required": [
+              "webhookURL"
+            ]
           }
         }
       ]
@@ -209,7 +247,9 @@
             "minLength": 1
           }
         },
-        "required": ["name"]
+        "required": [
+          "name"
+        ]
       }
     },
     "extraVolumeMounts": {
@@ -226,7 +266,10 @@
             "minLength": 1
           }
         },
-        "required": ["name", "mountPath"]
+        "required": [
+          "name",
+          "mountPath"
+        ]
       }
     },
     "nodeSelector": {

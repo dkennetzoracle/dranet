@@ -20,9 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
+
+	"sigs.k8s.io/dranet/pkg/apis"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -157,6 +160,8 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
+	// What moving devices has cost this request so far; see attachBudget.
+	budget := &attachBudget{}
 	// Process the configurations of the ResourceClaim
 	for deviceName, config := range podConfig.DeviceConfigs {
 		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
@@ -183,7 +188,28 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 					return err
 				}
-			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice, np.slaacReadyTimeout, np.slaacRollbackReserve, budget); err != nil {
+				var notReady *slaacNotReadyError
+				if errors.As(err, &notReady) {
+					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceNotReady",
+						"%v in pod %s/%s; the interface was returned to the host and the sandbox fails so the kubelet retries", err, pod.GetNamespace(), pod.GetName())
+					// Say so on the claim as well: the Pod's events are the first
+					// place to look and the claim is the second, and nothing else
+					// is left behind to explain a Pod that never starts.
+					np.applyClaimStatus(logger, resourceClaim, resourceapply.ResourceClaimStatus().WithDevices(
+						resourceapply.AllocatedDeviceStatus().
+							WithDevice(deviceName).
+							WithDriver(np.driverName).
+							WithPool(np.nodeName).
+							WithConditions(metav1apply.Condition().
+								WithType("SLAACReady").
+								WithStatus(metav1.ConditionFalse).
+								WithReason("AutoconfigurationTimedOut").
+								WithMessage(notReady.err.Error()).
+								WithLastTransitionTime(metav1.Now())),
+					))
+					return err
+				}
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
 					"failed to attach network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 				return err
@@ -219,21 +245,7 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 	}
 	// do not block the handler to update the status
 	for claim, status := range statusUpdates {
-		resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
-		claimLogger := klog.LoggerWithValues(logger, "claim", klog.KRef(claim.Namespace, claim.Name))
-		go func() {
-			ctxStatus, cancel := context.WithTimeout(klog.NewContext(context.Background(), claimLogger), 3*time.Second)
-			defer cancel()
-			_, err := np.kubeClient.ResourceV1().ResourceClaims(claim.Namespace).ApplyStatus(ctxStatus,
-				resourceClaimApply,
-				metav1.ApplyOptions{FieldManager: np.driverName, Force: true},
-			)
-			if err != nil {
-				claimLogger.Error(err, "Failed to update status for claim")
-			} else {
-				claimLogger.V(4).Info("Updated status for claim")
-			}
-		}()
+		np.applyClaimStatus(logger, claim, status)
 	}
 
 	return nil
@@ -258,21 +270,114 @@ func attachRdmaToNS(ctx context.Context, linkDev, ns string, resourceClaimStatus
 	return nil
 }
 
+// slaacNotReadyError reports an interface that did not finish IPv6
+// autoconfiguration within its budget. The interface is back on the host by
+// the time it is returned.
+type slaacNotReadyError struct {
+	deviceName string
+	ifName     string
+	err        error
+}
+
+func (e *slaacNotReadyError) Error() string {
+	return fmt.Sprintf("interface %s of network device %s did not complete IPv6 autoconfiguration: %v", e.ifName, e.deviceName, e.err)
+}
+
+func (e *slaacNotReadyError) Unwrap() error { return e.err }
+
+// applyClaimStatus updates a claim's status in the background, so the runtime
+// hook that produced it does not wait on the API server.
+func (np *NetworkDriver) applyClaimStatus(logger klog.Logger, claim types.NamespacedName, status *resourceapply.ResourceClaimStatusApplyConfiguration) {
+	resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
+	claimLogger := klog.LoggerWithValues(logger, "claim", klog.KRef(claim.Namespace, claim.Name))
+	go func() {
+		ctxStatus, cancel := context.WithTimeout(klog.NewContext(context.Background(), claimLogger), 3*time.Second)
+		defer cancel()
+		_, err := np.kubeClient.ResourceV1().ResourceClaims(claim.Namespace).ApplyStatus(ctxStatus,
+			resourceClaimApply,
+			metav1.ApplyOptions{FieldManager: np.driverName, Force: true},
+		)
+		if err != nil {
+			claimLogger.Error(err, "Failed to update status for claim")
+		} else {
+			claimLogger.V(4).Info("Updated status for claim")
+		}
+	}()
+}
+
 // attachNetdevToNS moves the host network interface into the pod network namespace,
 // applies all associated configuration (ethtool, eBPF, routes, rules, neighbors),
-// and records the resulting status conditions on resourceClaimStatusDevice.
-func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+// waits for IPv6 autoconfiguration when the interface uses it, and records the
+// resulting status conditions on resourceClaimStatusDevice. budget is shared by
+// the devices of one request; see attachBudget.
+func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration, slaacReadyTimeout, slaacRollbackReserve time.Duration, budget *attachBudget) error {
 	ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger := klog.LoggerWithValues(klog.FromContext(ctx), "device", deviceName, "interface", ifName, "netns", ns)
 	logger.V(2).Info("RunPodSandbox processing Network device")
+	slaac := config.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC
+
+	// A SLAAC interface may have to come back if its address never arrives,
+	// and that costs about what the move does. Only move it while both still
+	// fit in the request; failing here leaves the host untouched and the
+	// sandbox retried, where a late reply would leave the Pod without it.
+	if slaac {
+		if err := budget.check(ctx, ifName, slaacRollbackReserve); err != nil {
+			logger.Error(err, "RunPodSandbox not moving the network device")
+			return err
+		}
+	}
+
 	// TODO config options to rename the device and pass parameters
 	// use https://github.com/opencontainers/runtime-spec/pull/1271
+	start := time.Now()
 	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
 	}
+	attachTook := time.Since(start)
+	budget.record(attachTook)
 
+	// Link-level configuration first (ethtool, eBPF, VRF): enslaving the
+	// interface to a VRF cycles the link and drops the address it had, so a
+	// SLAAC wait has to come after it.
+	vrfTable, err := configureLinkInNS(ctx, ns, deviceName, config, networkData.InterfaceName)
+	if err != nil {
+		return err
+	}
+
+	// With SLAAC the interface is up but not yet usable: its address arrives
+	// from a router advertisement some milliseconds later. Wait for it here,
+	// while there is still a namespace to roll back out of, and before the
+	// routes: one through a gateway in the advertised prefix is unreachable
+	// until the advertisement has arrived. Rolling back costs about what the
+	// move did, so that is the least the wait leaves for it.
+	if slaac {
+		reserve := max(slaacRollbackReserve, attachTook)
+		addresses, err := awaitSLAACReady(ctx, ns, networkData.InterfaceName, ifName, slaacReadyTimeout, reserve)
+		if err != nil {
+			logger.Error(err, "RunPodSandbox interface did not complete IPv6 autoconfiguration")
+			return &slaacNotReadyError{deviceName: deviceName, ifName: networkData.InterfaceName, err: err}
+		}
+		networkData.IPs = append(networkData.IPs, addresses...)
+		resourceClaimStatusDevice.WithConditions(
+			metav1apply.Condition().
+				WithType("SLAACReady").
+				WithStatus(metav1.ConditionTrue).
+				WithReason("SLAACReady").
+				WithMessage(fmt.Sprintf("autoconfigured addresses: %s", strings.Join(addresses, ","))).
+				WithLastTransitionTime(metav1.Now()),
+		)
+	}
+
+	// Routes, rules and neighbors, now that the addresses they may depend on
+	// are in place.
+	if err := configureRoutingInNS(ctx, ns, deviceName, config, networkData.InterfaceName, vrfTable, resourceClaimStatusDevice); err != nil {
+		return err
+	}
+
+	// Report the device only now, so a failure above leaves the status
+	// without a Ready condition or network data.
 	resourceClaimStatusDevice.WithConditions(
 		metav1apply.Condition().
 			WithType("Ready").
@@ -284,9 +389,7 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 		WithHardwareAddress(networkData.HardwareAddress).
 		WithIPs(networkData.IPs...),
 	) // End of WithNetworkData
-
-	// Configure the moved device (ethtool, vrf, routes, neighbors, rules)
-	return configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice)
+	return nil
 }
 
 // createSubinterfaceInNS creates a subinterface in the pod network namespace,
@@ -330,6 +433,18 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 // configureNetdevInNS applies common L3 configurations (ethtool, eBPF, VRF, routes, rules, and neighbors)
 // to a network interface inside the container's network namespace and marks the claim status as NetworkReady.
 func configureNetdevInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, ifNameInNs string, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+	vrfTable, err := configureLinkInNS(ctx, ns, deviceName, config, ifNameInNs)
+	if err != nil {
+		return err
+	}
+	return configureRoutingInNS(ctx, ns, deviceName, config, ifNameInNs, vrfTable, resourceClaimStatusDevice)
+}
+
+// configureLinkInNS applies the link-level configuration (ethtool, eBPF, VRF)
+// and returns the VRF table the routing has to use, 0 for none. It is the
+// half that has to happen before an autoconfigured address is waited for:
+// enslaving the interface to a VRF cycles the link and drops the address.
+func configureLinkInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, ifNameInNs string) (int, error) {
 	logger := klog.FromContext(ctx)
 	var err error
 
@@ -338,7 +453,7 @@ func configureNetdevInNS(ctx context.Context, ns, deviceName string, config Devi
 		err = applyEthtoolConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Ethtool)
 		if err != nil {
 			logger.Error(err, "RunPodSandbox error applying ethtool config", "podInterface", ifNameInNs)
-			return fmt.Errorf("error applying ethtool config for %s in ns %s: %v", ifNameInNs, ns, err)
+			return 0, fmt.Errorf("error applying ethtool config for %s in ns %s: %v", ifNameInNs, ns, err)
 		}
 	}
 
@@ -348,7 +463,7 @@ func configureNetdevInNS(ctx context.Context, ns, deviceName string, config Devi
 		err = detachEBPFPrograms(ns, ifNameInNs)
 		if err != nil {
 			logger.Error(err, "Error disabling ebpf programs", "podInterface", ifNameInNs)
-			return fmt.Errorf("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
+			return 0, fmt.Errorf("error disabling ebpf programs for %s in ns %s: %v", ifNameInNs, ns, err)
 		}
 	}
 
@@ -356,9 +471,19 @@ func configureNetdevInNS(ctx context.Context, ns, deviceName string, config Devi
 	if config.NetworkInterfaceConfigInPod.Interface.VRF != nil {
 		vrfTable, err = applyVRFConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Interface.VRF)
 		if err != nil {
-			return fmt.Errorf("error configuring VRF for device %s in ns %s: %w", deviceName, ns, err)
+			return 0, fmt.Errorf("error configuring VRF for device %s in ns %s: %w", deviceName, ns, err)
 		}
 	}
+	return vrfTable, nil
+}
+
+// configureRoutingInNS applies routes, rules and neighbors and marks the claim
+// status as NetworkReady. It is the half that has to happen after an
+// autoconfigured address is in place: a route through a gateway in the
+// advertised prefix is unreachable until the advertisement has arrived.
+func configureRoutingInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, ifNameInNs string, vrfTable int, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+	logger := klog.FromContext(ctx)
+	var err error
 
 	// Configure routes
 	err = applyRoutingConfig(ns, ifNameInNs, config.NetworkInterfaceConfigInPod.Routes, vrfTable)
