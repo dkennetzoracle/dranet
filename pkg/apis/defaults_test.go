@@ -52,6 +52,7 @@ func TestInterfaceConfigDefault(t *testing.T) {
 				AcceptRA:                ptr.To[int32](2),
 				DADTransmits:            ptr.To[int32](0),
 				RouterSolicitationDelay: ptr.To[int32](0),
+				DisableIPv6:             ptr.To(false),
 			},
 		},
 		{
@@ -66,6 +67,7 @@ func TestInterfaceConfigDefault(t *testing.T) {
 				HardwareAddr:            ptr.To("02:00:00:00:00:01"),
 				AcceptRA:                ptr.To[int32](2),
 				RouterSolicitationDelay: ptr.To[int32](0),
+				DisableIPv6:             ptr.To(false),
 			},
 		},
 		{
@@ -76,6 +78,8 @@ func TestInterfaceConfigDefault(t *testing.T) {
 				AcceptRA:                ptr.To[int32](1),
 				DADTransmits:            ptr.To[int32](2),
 				RouterSolicitationDelay: ptr.To[int32](1),
+				DisableIPv6:             ptr.To(false),
+				AddrGenMode:             ptr.To[int32](2),
 			},
 			want: InterfaceConfig{
 				Name:                    "eth0",
@@ -83,7 +87,44 @@ func TestInterfaceConfigDefault(t *testing.T) {
 				AcceptRA:                ptr.To[int32](1),
 				DADTransmits:            ptr.To[int32](2),
 				RouterSolicitationDelay: ptr.To[int32](1),
+				DisableIPv6:             ptr.To(false),
+				AddrGenMode:             ptr.To[int32](2),
 			},
+		},
+		{
+			// A child shares its parent's hardware address, so it needs its own
+			// interface identifier, and the address that identifier gives is
+			// new to the link, so duplicate address detection runs.
+			name: "SLAAC on an IPVLAN child generates a random identifier and keeps duplicate address detection",
+			cfg:  InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeSLAAC},
+			want: InterfaceConfig{
+				Name:                    "rdma0",
+				Type:                    InterfaceTypeIPVLAN,
+				Addressing:              AddressingModeSLAAC,
+				AcceptRA:                ptr.To[int32](2),
+				RouterSolicitationDelay: ptr.To[int32](0),
+				DisableIPv6:             ptr.To(false),
+				AddrGenMode:             ptr.To[int32](3),
+			},
+		},
+		{
+			name: "SLAAC on an IPVLAN child keeps an explicit dadTransmits",
+			cfg:  InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeSLAAC, DADTransmits: ptr.To[int32](0)},
+			want: InterfaceConfig{
+				Name:                    "rdma0",
+				Type:                    InterfaceTypeIPVLAN,
+				Addressing:              AddressingModeSLAAC,
+				AcceptRA:                ptr.To[int32](2),
+				DADTransmits:            ptr.To[int32](0),
+				RouterSolicitationDelay: ptr.To[int32](0),
+				DisableIPv6:             ptr.To(false),
+				AddrGenMode:             ptr.To[int32](3),
+			},
+		},
+		{
+			name: "static addressing does not touch disableIPv6 or addrGenMode",
+			cfg:  InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addresses: []string{"10.0.0.1/24"}},
+			want: InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addresses: []string{"10.0.0.1/24"}},
 		},
 	}
 	for _, tt := range tests {

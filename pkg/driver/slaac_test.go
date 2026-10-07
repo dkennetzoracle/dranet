@@ -726,3 +726,170 @@ func testAttachNetdevToNSRoutesAfterSLAAC_Namespaced(t *testing.T) {
 		t.Errorf("status conditions mismatch (-want +got):\n%s", diff)
 	}
 }
+
+// disableIPv6ByDefault makes interfaces created in or moved into the namespace
+// start with IPv6 off, as some CNI plugins leave a Pod namespace on IPv4-only
+// clusters.
+func disableIPv6ByDefault(t *testing.T, ns netns.NsHandle) {
+	t.Helper()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	origns, err := netns.Get()
+	if err != nil {
+		t.Fatalf("failed to get the current namespace: %v", err)
+	}
+	defer origns.Close()
+	if err := netns.Set(ns); err != nil {
+		t.Fatalf("failed to join the test namespace: %v", err)
+	}
+	writeErr := os.WriteFile("/proc/sys/net/ipv6/conf/default/disable_ipv6", []byte("1"), 0o644)
+	if err := netns.Set(origns); err != nil {
+		t.Fatalf("failed to restore the original namespace: %v", err)
+	}
+	if writeErr != nil {
+		t.Fatalf("failed to disable IPv6 by default in the test namespace: %v", writeErr)
+	}
+}
+
+// addRail creates a veth pair: the first end plays an RDMA NIC that stays on
+// the host as the parent of a subinterface, the second plays its router.
+func addRail(t *testing.T, nicName, routerName string) netlink.Link {
+	t.Helper()
+	if err := netlink.LinkAdd(&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: nicName}, PeerName: routerName}); err != nil {
+		t.Fatalf("failed to add veth pair %s/%s: %v", nicName, routerName, err)
+	}
+	t.Cleanup(func() {
+		if link, err := nlwrap.LinkByName(routerName); err == nil {
+			_ = netlink.LinkDel(link)
+		}
+	})
+	_ = os.WriteFile("/proc/sys/net/ipv6/conf/"+routerName+"/dad_transmits", []byte("0"), 0o644)
+	router, err := nlwrap.LinkByName(routerName)
+	if err != nil {
+		t.Fatalf("failed to get link %s: %v", routerName, err)
+	}
+	if err := netlink.LinkSetUp(router); err != nil {
+		t.Fatalf("failed to set up link %s: %v", routerName, err)
+	}
+	return router
+}
+
+// slaacSubinterfaceConfig is the configuration of an IPVLAN child with SLAAC
+// addressing, defaulted the way the merged claim configuration is.
+func slaacSubinterfaceConfig(parent, name string) DeviceConfig {
+	config := DeviceConfig{
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: parent}},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{
+			Name:       name,
+			Type:       apis.InterfaceTypeIPVLAN,
+			Addressing: apis.AddressingModeSLAAC,
+		}},
+	}
+	config.NetworkInterfaceConfigInPod.Default()
+	return config
+}
+
+func TestSubinterfacesSLAACFromRouterAdvertisements(t *testing.T) {
+	userns.Run(t, testSubinterfacesSLAACFromRouterAdvertisements_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+// Two IPVLAN children on two rails, in a namespace with IPv6 off by default,
+// are waited for together and each gets an address from its own rail.
+func testSubinterfacesSLAACFromRouterAdvertisements_Namespaced(t *testing.T) {
+	containerNsPath, containerNs, _ := testNetns(t)
+	disableIPv6ByDefault(t, containerNs)
+
+	prefixes := []string{"2001:db8:10::/64", "2001:db8:11::/64"}
+	stop := make(chan struct{})
+	defer close(stop)
+	var pending []*pendingSubinterface
+	for i, cidr := range prefixes {
+		nic, rtr := fmt.Sprintf("rail%d", i), fmt.Sprintf("rtr%d", i)
+		router := addRail(t, nic, rtr)
+		_, prefix, err := net.ParseCIDR(cidr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go advertisePrefix(t, router.Attrs().Index, *prefix, stop)
+
+		status := resourceapply.AllocatedDeviceStatus()
+		p, err := createSubinterfaceInNS(context.Background(), containerNsPath, nic, slaacSubinterfaceConfig(nic, fmt.Sprintf("rdma%d", i)), status)
+		if err != nil {
+			t.Fatalf("createSubinterfaceInNS(%s) error: %v", nic, err)
+		}
+		if p == nil {
+			t.Fatalf("createSubinterfaceInNS(%s) returned no pending subinterface for addressing SLAAC", nic)
+		}
+		if len(status.Conditions) != 0 {
+			t.Errorf("status of %s before the wait has %d conditions, want none", nic, len(status.Conditions))
+		}
+		pending = append(pending, p)
+	}
+
+	results, err := awaitSubinterfacesSLAAC(context.Background(), containerNsPath, pending, 10*time.Second, DefaultSLAACRollbackReserve)
+	if err != nil {
+		t.Fatalf("awaitSubinterfacesSLAAC() error: %v", err)
+	}
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("subinterface %d: %v", i, r.err)
+		}
+		want := strings.TrimSuffix(prefixes[i], ":/64")
+		if len(r.addresses) != 1 || !strings.HasPrefix(r.addresses[0], want) {
+			t.Errorf("subinterface %d addresses = %v, want one in %s", i, r.addresses, prefixes[i])
+		}
+		if err := finishSubinterfaceInNS(context.Background(), containerNsPath, pending[i], r.addresses); err != nil {
+			t.Fatalf("finishSubinterfaceInNS(%d) error: %v", i, err)
+		}
+		types := map[string]bool{}
+		for _, c := range pending[i].status.Conditions {
+			types[*c.Type] = true
+		}
+		if !types["SLAACReady"] || !types["Ready"] || !types["NetworkReady"] {
+			t.Errorf("subinterface %d conditions = %v, want SLAACReady, NetworkReady and Ready", i, types)
+		}
+		if pending[i].status.NetworkData == nil || len(pending[i].status.NetworkData.IPs) != 1 {
+			t.Errorf("subinterface %d network data = %+v, want the autoconfigured address", i, pending[i].status.NetworkData)
+		}
+	}
+}
+
+func TestSubinterfacesSLAACTimeoutDeletesChildren(t *testing.T) {
+	userns.Run(t, testSubinterfacesSLAACTimeoutDeletesChildren_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+// Without router advertisements the wait fails and every child of the request
+// is deleted, so the kubelet's retry starts from a clean namespace.
+func testSubinterfacesSLAACTimeoutDeletesChildren_Namespaced(t *testing.T) {
+	containerNsPath, containerNs, _ := testNetns(t)
+	var pending []*pendingSubinterface
+	for i := range 2 {
+		nic := fmt.Sprintf("rail%d", i)
+		addRail(t, nic, fmt.Sprintf("rtr%d", i))
+		p, err := createSubinterfaceInNS(context.Background(), containerNsPath, nic, slaacSubinterfaceConfig(nic, fmt.Sprintf("rdma%d", i)), resourceapply.AllocatedDeviceStatus())
+		if err != nil || p == nil {
+			t.Fatalf("createSubinterfaceInNS(%s) = %v, %v; want a pending subinterface", nic, p, err)
+		}
+		pending = append(pending, p)
+	}
+
+	results, err := awaitSubinterfacesSLAAC(context.Background(), containerNsPath, pending, 300*time.Millisecond, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("awaitSubinterfacesSLAAC() deletion error: %v", err)
+	}
+	for i, r := range results {
+		if r.err == nil {
+			t.Errorf("subinterface %d: want a timeout error without router advertisements", i)
+		}
+	}
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nhNs.Close()
+	for _, p := range pending {
+		if _, err := nhNs.LinkByName(p.networkData.InterfaceName); err == nil {
+			t.Errorf("subinterface %s still exists after the failed wait", p.networkData.InterfaceName)
+		}
+	}
+}

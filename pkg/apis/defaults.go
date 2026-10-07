@@ -41,15 +41,26 @@ func (c *InterfaceConfig) defaultSLAAC() {
 		// namespace may have forwarding on.
 		c.AcceptRA = ptr.To[int32](2)
 	}
-	if c.DADTransmits == nil && c.HardwareAddr == nil {
+	if c.DisableIPv6 == nil {
+		// The interface takes the Pod namespace default, and some CNI plugins
+		// disable IPv6 there on IPv4-only clusters; autoconfiguration cannot run
+		// without it.
+		c.DisableIPv6 = ptr.To(false)
+	}
+	if c.AddrGenMode == nil && c.IsSubinterface() {
+		// An IPVLAN child shares its parent's hardware address, so an EUI-64
+		// interface identifier would give it the parent's own addresses.
+		c.AddrGenMode = ptr.To[int32](3)
+	}
+	if c.DADTransmits == nil && c.HardwareAddr == nil && !c.IsSubinterface() {
 		// Duplicate Address Detection holds a new address tentative for roughly
 		// a second per probe, which does not fit the runtime's sandbox deadline.
 		// Skipping it is safe only because the interface keeps its hardware
 		// address: the address it derives in the Pod is the one the host held
 		// on the same link, and the host already ran detection on it. With a
-		// new hardware address the address is new to the link, so the kernel
-		// default stays and detection runs; set dadTransmits: 0 explicitly to
-		// opt out (RFC 4862 section 5.4).
+		// new hardware address, or on a subinterface, whose generated identifier
+		// is new to the link, the kernel default stays and detection runs; set
+		// dadTransmits: 0 explicitly to opt out (RFC 4862 section 5.4).
 		c.DADTransmits = ptr.To[int32](0)
 	}
 	if c.RouterSolicitationDelay == nil {

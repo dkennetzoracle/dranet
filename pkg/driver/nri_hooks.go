@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 
 	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	metav1apply "k8s.io/client-go/applyconfigurations/meta/v1"
@@ -162,6 +163,10 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
 	// What moving devices has cost this request so far; see attachBudget.
 	budget := &attachBudget{}
+	// Subinterfaces with addressing "SLAAC", and their claims, waited for
+	// together once every device is in place; see pendingSubinterface.
+	var pendingSubinterfaces []*pendingSubinterface
+	var pendingClaims []types.NamespacedName
 	// Process the configurations of the ResourceClaim
 	for deviceName, config := range podConfig.DeviceConfigs {
 		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
@@ -179,35 +184,28 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			WithPool(np.nodeName)
 
 		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
+		statusDeferred := false
 
 		// Block 1: netdev operations — only when a network interface is present.
 		if ifName != "" {
 			if config.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-				if err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice); err != nil {
+				p, err := createSubinterfaceInNS(ctx, ns, deviceName, config, resourceClaimStatusDevice)
+				if err != nil {
 					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
 						"failed to create subinterface on network device %s to pod %s/%s: %v", deviceName, pod.GetNamespace(), pod.GetName(), err)
 					return err
 				}
+				if p != nil {
+					// Its address is waited for after the loop, together with
+					// the other subinterfaces, and its status added then.
+					pendingSubinterfaces = append(pendingSubinterfaces, p)
+					pendingClaims = append(pendingClaims, resourceClaim)
+					statusDeferred = true
+				}
 			} else if err := attachNetdevToNS(ctx, ns, deviceName, config, resourceClaimStatusDevice, np.slaacReadyTimeout, np.slaacRollbackReserve, budget); err != nil {
 				var notReady *slaacNotReadyError
 				if errors.As(err, &notReady) {
-					np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceNotReady",
-						"%v in pod %s/%s; the interface was returned to the host and the sandbox fails so the kubelet retries", err, pod.GetNamespace(), pod.GetName())
-					// Say so on the claim as well: the Pod's events are the first
-					// place to look and the claim is the second, and nothing else
-					// is left behind to explain a Pod that never starts.
-					np.applyClaimStatus(logger, resourceClaim, resourceapply.ResourceClaimStatus().WithDevices(
-						resourceapply.AllocatedDeviceStatus().
-							WithDevice(deviceName).
-							WithDriver(np.driverName).
-							WithPool(np.nodeName).
-							WithConditions(metav1apply.Condition().
-								WithType("SLAACReady").
-								WithStatus(metav1.ConditionFalse).
-								WithReason("AutoconfigurationTimedOut").
-								WithMessage(notReady.err.Error()).
-								WithLastTransitionTime(metav1.Now())),
-					))
+					np.reportSLAACNotReady(logger, pod, resourceClaim, deviceName, notReady, "the interface was returned to the host")
 					return err
 				}
 				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceAttachFailed",
@@ -241,8 +239,34 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			)
 		}
 
-		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
+		if !statusDeferred {
+			resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
+		}
 	}
+
+	if len(pendingSubinterfaces) > 0 {
+		results, err := awaitSubinterfacesSLAAC(ctx, ns, pendingSubinterfaces, np.slaacReadyTimeout, np.slaacRollbackReserve)
+		var notReadyErrs []error
+		for i, p := range pendingSubinterfaces {
+			if i < len(results) && results[i].err != nil {
+				notReady := &slaacNotReadyError{deviceName: p.deviceName, ifName: p.networkData.InterfaceName, err: results[i].err}
+				np.reportSLAACNotReady(logger, pod, pendingClaims[i], p.deviceName, notReady, "the subinterfaces were deleted")
+				notReadyErrs = append(notReadyErrs, notReady)
+			}
+		}
+		if err != nil || len(notReadyErrs) > 0 {
+			return errors.Join(append(notReadyErrs, err)...)
+		}
+		for i, p := range pendingSubinterfaces {
+			if err := finishSubinterfaceInNS(ctx, ns, p, results[i].addresses); err != nil {
+				np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceCreateFailed",
+					"failed to configure subinterface on network device %s to pod %s/%s: %v", p.deviceName, pod.GetNamespace(), pod.GetName(), err)
+				return err
+			}
+			statusUpdates[pendingClaims[i]].WithDevices(p.status)
+		}
+	}
+
 	// do not block the handler to update the status
 	for claim, status := range statusUpdates {
 		np.applyClaimStatus(logger, claim, status)
@@ -268,6 +292,28 @@ func attachRdmaToNS(ctx context.Context, linkDev, ns string, resourceClaimStatus
 			WithLastTransitionTime(metav1.Now()),
 	)
 	return nil
+}
+
+// reportSLAACNotReady records an interface that did not finish IPv6
+// autoconfiguration on the Pod's events and on its claim: the events are the
+// first place to look and the claim is the second, and nothing else is left
+// behind to explain a Pod that never starts. outcome says what became of the
+// interface.
+func (np *NetworkDriver) reportSLAACNotReady(logger klog.Logger, pod *api.PodSandbox, claim types.NamespacedName, deviceName string, notReady *slaacNotReadyError, outcome string) {
+	np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "NetworkDeviceNotReady",
+		"%v in pod %s/%s; %s and the sandbox fails so the kubelet retries", notReady, pod.GetNamespace(), pod.GetName(), outcome)
+	np.applyClaimStatus(logger, claim, resourceapply.ResourceClaimStatus().WithDevices(
+		resourceapply.AllocatedDeviceStatus().
+			WithDevice(deviceName).
+			WithDriver(np.driverName).
+			WithPool(np.nodeName).
+			WithConditions(metav1apply.Condition().
+				WithType("SLAACReady").
+				WithStatus(metav1.ConditionFalse).
+				WithReason("AutoconfigurationTimedOut").
+				WithMessage(notReady.err.Error()).
+				WithLastTransitionTime(metav1.Now())),
+	))
 }
 
 // slaacNotReadyError reports an interface that did not finish IPv6
@@ -394,7 +440,11 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 
 // createSubinterfaceInNS creates a subinterface in the pod network namespace,
 // applies all associated configurations, and records the status conditions.
-func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) error {
+//
+// A subinterface with addressing "SLAAC" only gets its link-level configuration
+// here and is returned as pending: its address is waited for together with the
+// other subinterfaces of the Pod, and finishSubinterfaceInNS completes it.
+func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config DeviceConfig, resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration) (*pendingSubinterface, error) {
 	logger := klog.FromContext(ctx)
 	hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger.V(2).Info("RunPodSandbox creating subinterface on parent device", "parentDevice", hostIfName)
@@ -402,20 +452,61 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 	networkData, err := nsCreateSubinterface(hostIfName, ns, config.NetworkInterfaceConfigInPod.Interface)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error creating subinterface", "parentDevice", hostIfName, "netns", ns)
-		return fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
+		return nil, fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)
 	}
-
-	// Configure the subinterface (ethtool, vrf, routes, neighbors, rules)
-	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
-		// Delete the child now rather than leaving it half configured until pod teardown.
+	// Delete the child now rather than leaving it half configured until pod teardown.
+	deleteOnError := func(err error) error {
 		if delErr := nsDeleteSubinterface(ns, networkData.InterfaceName); delErr != nil {
 			return errors.Join(err, fmt.Errorf("failed to delete subinterface %s after a configuration failure: %w", networkData.InterfaceName, delErr))
 		}
 		return err
 	}
 
-	// Report the device only after the configuration succeeds, so a failure
-	// leaves the status without a Ready condition or network data.
+	if config.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC {
+		// Link-level configuration first: enslaving the child to a VRF cycles
+		// the link and drops the address it had.
+		vrfTable, err := configureLinkInNS(ctx, ns, deviceName, config, networkData.InterfaceName)
+		if err != nil {
+			return nil, deleteOnError(err)
+		}
+		return &pendingSubinterface{deviceName: deviceName, config: config, vrfTable: vrfTable, networkData: networkData, status: resourceClaimStatusDevice}, nil
+	}
+
+	// Configure the subinterface (ethtool, vrf, routes, neighbors, rules)
+	if err := configureNetdevInNS(ctx, ns, deviceName, config, networkData.InterfaceName, resourceClaimStatusDevice); err != nil {
+		return nil, deleteOnError(err)
+	}
+	reportSubinterfaceReady(resourceClaimStatusDevice, networkData)
+	return nil, nil
+}
+
+// finishSubinterfaceInNS completes a pending subinterface once its
+// autoconfigured addresses are in place: it records them, applies the routes,
+// rules and neighbors that may depend on them, and reports the device ready.
+func finishSubinterfaceInNS(ctx context.Context, ns string, p *pendingSubinterface, addresses []string) error {
+	p.networkData.IPs = append(p.networkData.IPs, addresses...)
+	p.status.WithConditions(
+		metav1apply.Condition().
+			WithType("SLAACReady").
+			WithStatus(metav1.ConditionTrue).
+			WithReason("SLAACReady").
+			WithMessage(fmt.Sprintf("autoconfigured addresses: %s", strings.Join(addresses, ","))).
+			WithLastTransitionTime(metav1.Now()),
+	)
+	if err := configureRoutingInNS(ctx, ns, p.deviceName, p.config, p.networkData.InterfaceName, p.vrfTable, p.status); err != nil {
+		if delErr := nsDeleteSubinterface(ns, p.networkData.InterfaceName); delErr != nil {
+			return errors.Join(err, fmt.Errorf("failed to delete subinterface %s after a configuration failure: %w", p.networkData.InterfaceName, delErr))
+		}
+		return err
+	}
+	reportSubinterfaceReady(p.status, p.networkData)
+	return nil
+}
+
+// reportSubinterfaceReady records the Ready condition and the network data of
+// a subinterface. It runs only after the configuration succeeds, so a failure
+// leaves the status without a Ready condition or network data.
+func reportSubinterfaceReady(resourceClaimStatusDevice *resourceapply.AllocatedDeviceStatusApplyConfiguration, networkData *resourceapi.NetworkDeviceData) {
 	resourceClaimStatusDevice.WithConditions(
 		metav1apply.Condition().
 			WithType("Ready").
@@ -427,7 +518,6 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 		WithHardwareAddress(networkData.HardwareAddress).
 		WithIPs(networkData.IPs...),
 	)
-	return nil
 }
 
 // configureNetdevInNS applies common L3 configurations (ethtool, eBPF, VRF, routes, rules, and neighbors)

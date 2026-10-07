@@ -106,6 +106,15 @@ type InterfaceConfig struct {
 	// sending its first Router Solicitation through
 	// /proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay, in seconds.
 	RouterSolicitationDelay *int32 `json:"routerSolicitationDelay,omitempty"`
+
+	// DisableIPv6 turns IPv6 off or on for the interface through
+	// /proc/sys/net/ipv6/conf/<iface>/disable_ipv6.
+	DisableIPv6 *bool `json:"disableIPv6,omitempty"`
+
+	// AddrGenMode selects how the kernel generates the interface identifier of
+	// the interface's IPv6 addresses through
+	// /proc/sys/net/ipv6/conf/<iface>/addr_gen_mode.
+	AddrGenMode *int32 `json:"addrGenMode,omitempty"`
 }
 ```
 
@@ -123,13 +132,16 @@ type InterfaceConfig struct {
 * **acceptRA** (int32, optional): Whether the interface accepts IPv6 router advertisements. `0` rejects them, `1` accepts them when forwarding is off, and `2` accepts them also when forwarding is on. Sets `/proc/sys/net/ipv6/conf/<iface>/accept_ra`.
 * **dadTransmits** (int32, optional): How many Duplicate Address Detection probes the interface sends for a new IPv6 address. Sets `/proc/sys/net/ipv6/conf/<iface>/dad_transmits`.
 * **routerSolicitationDelay** (int32, optional): How many seconds the interface waits before sending its first Router Solicitation. Sets `/proc/sys/net/ipv6/conf/<iface>/router_solicitation_delay`.
+* **disableIPv6** (bool, optional): Whether IPv6 is off on the interface. Sets `/proc/sys/net/ipv6/conf/<iface>/disable_ipv6`. An interface takes the Pod namespace default when it moves or is created there, and some CNI plugins disable IPv6 in the Pod namespace on IPv4-only clusters (the OCI VCN-Native CNI on OKE does), so an interface that needs IPv6 in the Pod has to set `false`. `addressing: SLAAC` defaults it to `false`.
+* **addrGenMode** (int32, optional): How the kernel generates the interface identifier of the interface's IPv6 addresses: `0` from the hardware address (EUI-64), `1` no link-local address, `2` from a stable secret, `3` random. Sets `/proc/sys/net/ipv6/conf/<iface>/addr_gen_mode`. `addressing: SLAAC` on an IPVLAN interface defaults it to `3`.
 * **addressing** (string, optional): How the interface gets its addresses: `Static` (the default, from `addresses` or a provider profile), `DHCP`, `SLAAC`, or `Unnumbered` (subinterfaces only). See [IPv6 autoconfiguration](#ipv6-autoconfiguration-slaac).
 
 The kernel resets both ARP settings to the network namespace default when an interface
 moves into a Pod, so a value configured on the host does not survive the move and has to
 be requested here. The kernel resets `accept_ra` the same way when the interface moves.
 The kernel creates IPv6 settings only for an interface with an MTU of 1280 or more.
-A claim with `acceptRA`, `dadTransmits`, `routerSolicitationDelay` or `addressing: SLAAC`
+A claim with `acceptRA`, `dadTransmits`, `routerSolicitationDelay`, `disableIPv6`, `addrGenMode`
+or `addressing: SLAAC`
 is rejected when its `mtu` is below 1280, or when it sets no `mtu` and the interface would
 keep a smaller MTU from the host. The check runs before the interface is touched. When the
 interface has no `accept_ra` sysctl, for example on a node that boots with
@@ -222,8 +234,10 @@ With `addressing: SLAAC` DRANET:
   re-learn from advertisements (`proto ra`). IPv4 has no autoconfiguration to defer to,
   so a dual-stack interface still inherits its IPv4 addresses, or takes IPv4 `addresses`
   from the claim, as any passthrough interface does;
-* defaults `acceptRA: 2` and `routerSolicitationDelay: 0`, and `dadTransmits: 0` when the
-  interface keeps its hardware address, all of which you can override. The kernel resets
+* defaults `disableIPv6: false`, `acceptRA: 2` and `routerSolicitationDelay: 0`, and
+  `dadTransmits: 0` when the interface keeps its hardware address, all of which you can
+  override. `disableIPv6: false` matters on clusters whose CNI disables IPv6 in the Pod
+  namespace: without it the interface never gets an address. The kernel resets
   these when the interface moves, so they have to be requested; the last two are what bring
   address acquisition down from a couple of seconds to a few milliseconds, which is what
   makes it fit the runtime's deadline. Skipping duplicate address detection is a deliberate
@@ -270,9 +284,38 @@ status `False` and the reason the interface was not ready, next to the Pod's
 A rolled-back interface is back on the host under its original name and up, as after any
 detach; settings the host had on it beyond that, such as a VRF membership, are not restored.
 
-`SLAAC` requires a passthrough interface: only that path waits for the autoconfigured
-address and rolls the interface back if none arrives. It cannot be combined with IPv6
-`addresses` or with `acceptRA: 0`.
+`SLAAC` cannot be combined with IPv6 `addresses`, `acceptRA: 0` or `disableIPv6: true`.
+
+##### SLAAC on an IPVLAN subinterface
+
+With `type: IPVLAN` the parent NIC stays on the host and the Pod gets a child that
+autoconfigures its own address from the parent link's router advertisements:
+
+```yaml
+interface:
+  type: IPVLAN
+  addressing: SLAAC
+```
+
+The child shares its parent's hardware address, so two things differ from a passthrough
+interface:
+
+* `addrGenMode` defaults to `3` (random). EUI-64 would give the child the parent's own
+  addresses; `0` and `1` are rejected;
+* duplicate address detection keeps the kernel default, because the generated address is
+  new to the link. Detection also holds the link-local address tentative, and the kernel
+  sends its first Router Solicitation only after that, so with detection on the address
+  takes about two seconds and with `dadTransmits: 0` about 0.1 to 0.5 seconds. Set
+  `dadTransmits: 0` where the link layout rules out a duplicate, for example a link that
+  carries one host's addresses only.
+
+A child has nothing to roll back to the host, so DRANET does not wait for each child in
+turn: it creates all of the Pod's subinterfaces first and waits for their addresses
+together, after the last device, within the same `--slaac-ready-timeout` and request
+deadline. A Pod with one child per RDMA NIC then gets its addresses in the time one of them
+takes. If any of them has no address in time, DRANET deletes all of them and the sandbox
+fails, so the kubelet retries; after the request deadline it leaves them in place and
+records the failure on the claim.
 
 #### Route Configuration (RouteConfig)
 

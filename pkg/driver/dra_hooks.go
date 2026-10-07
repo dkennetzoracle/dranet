@@ -253,7 +253,15 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 		// TODO: define a strategy for multiple configs
 		if conf != nil {
-			userConf = conf
+			// Merge the configuration as the user wrote it, not the defaulted
+			// one ValidateConfig returns: the merged configuration is defaulted
+			// again once the cloud provider may have set the interface type.
+			written, err := apis.UnmarshalConfig(&config.Opaque.Parameters)
+			if err != nil {
+				configErrors = append(configErrors, err)
+				continue
+			}
+			userConf = written
 			break
 		}
 	}
@@ -497,14 +505,14 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	}
 
 	// A subinterface has no host addresses to inherit, so its addresses must
-	// come from the user config, a profile, or be explicitly waived via
-	// Addressing: Unnumbered. Routing (including any policy based routing) is
-	// owned by the user or the provider profile; the driver never synthesizes
-	// routes or rules.
+	// come from the user config, a profile, router advertisements via
+	// Addressing: SLAAC, or be explicitly waived via Addressing: Unnumbered.
+	// Routing (including any policy based routing) is owned by the user or the
+	// provider profile; the driver never synthesizes routes or rules.
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
 		iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
-		if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered {
-			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: Unnumbered", result.Device, iface.Type)
+		if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered && iface.Addressing != apis.AddressingModeSLAAC {
+			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: SLAAC or Unnumbered", result.Device, iface.Type)
 		}
 		if iface.Addressing == apis.AddressingModeUnnumbered {
 			klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)

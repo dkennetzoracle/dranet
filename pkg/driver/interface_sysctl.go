@@ -36,7 +36,8 @@ var sysctlProvider = sysctl.New
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
 	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil ||
 		interfaceConfig.AcceptRA != nil || interfaceConfig.DADTransmits != nil ||
-		interfaceConfig.RouterSolicitationDelay != nil
+		interfaceConfig.RouterSolicitationDelay != nil || interfaceConfig.DisableIPv6 != nil ||
+		interfaceConfig.AddrGenMode != nil
 }
 
 func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
@@ -53,6 +54,12 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 	}
 	if interfaceConfig.ARPAnnounce != nil {
 		set("ipv4", "arp_announce", *interfaceConfig.ARPAnnounce)
+	}
+	// The address generation mode decides the interface identifier of the
+	// link-local address, which the kernel generates as soon as IPv6 comes up,
+	// so it has to be in place before disable_ipv6 is cleared below.
+	if interfaceConfig.AddrGenMode != nil {
+		set("ipv6", "addr_gen_mode", *interfaceConfig.AddrGenMode)
 	}
 	// Set the solicitation and duplicate address detection behaviour before
 	// accepting advertisements, so the first solicitation the interface sends
@@ -74,6 +81,26 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 			klog.V(4).Infof("%s not found; IPv6 is not enabled on %s and acceptRA: 0 is already satisfied", name, ifName)
 		case errors.Is(err, os.ErrNotExist):
 			errorList = append(errorList, fmt.Errorf("failed to set %s: IPv6 is not enabled on the interface: %w", name, err))
+		default:
+			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
+		}
+	}
+	// Last, because enabling IPv6 starts address configuration with whatever
+	// the settings above are at that moment.
+	if interfaceConfig.DisableIPv6 != nil {
+		name := fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", ifName)
+		value := 0
+		if *interfaceConfig.DisableIPv6 {
+			value = 1
+		}
+		err := sysctlInterface.SetSysctl(name, value)
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrNotExist) && *interfaceConfig.DisableIPv6:
+			// The interface has no IPv6 sysctls, so IPv6 is already off.
+			klog.V(4).Infof("%s not found; IPv6 is not enabled on %s and disableIPv6: true is already satisfied", name, ifName)
+		case errors.Is(err, os.ErrNotExist):
+			errorList = append(errorList, fmt.Errorf("failed to set %s: IPv6 is not available on the interface: %w", name, err))
 		default:
 			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
 		}

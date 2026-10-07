@@ -538,6 +538,68 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			errCount:  1,
 		},
 		{
+			name:      "SLAAC addressing on an IPVLAN subinterface",
+			cfg:       &InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeSLAAC},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "SLAAC addressing on an IPVLAN subinterface with a stable-privacy identifier",
+			cfg:       &InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeSLAAC, AddrGenMode: ptr.To[int32](2)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			// EUI-64 would give the child its parent's own addresses.
+			name:      "SLAAC addressing on an IPVLAN subinterface with an EUI-64 identifier",
+			cfg:       &InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeSLAAC, AddrGenMode: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			// No link-local address means no router solicitation.
+			name:      "SLAAC addressing on an IPVLAN subinterface without a link-local address",
+			cfg:       &InterfaceConfig{Name: "rdma0", Type: InterfaceTypeIPVLAN, Addressing: AddressingModeSLAAC, AddrGenMode: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			// A passthrough interface keeps its own hardware address, so EUI-64 is fine.
+			name:      "SLAAC addressing on a passthrough interface with an EUI-64 identifier",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, AddrGenMode: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "SLAAC addressing with IPv6 disabled",
+			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, DisableIPv6: ptr.To(true)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "disableIPv6 and addrGenMode without SLAAC",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(false), AddrGenMode: ptr.To[int32](3)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "addrGenMode out of range",
+			cfg:       &InterfaceConfig{Name: "eth0", AddrGenMode: ptr.To[int32](4)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "disableIPv6 and addrGenMode with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(false), AddrGenMode: ptr.To[int32](3), MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  2,
+		},
+		{
 			name:      "unsupported addressing mode",
 			cfg:       &InterfaceConfig{Name: "eth0", Addressing: AddressingMode("Autoconf")},
 			fieldPath: "iface",

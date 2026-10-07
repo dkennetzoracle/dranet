@@ -21,11 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
+	resourceapi "k8s.io/api/resource/v1"
+	resourceapply "k8s.io/client-go/applyconfigurations/resource/v1"
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/dranet/internal/nlwrap"
@@ -295,4 +298,80 @@ func awaitSLAACReady(ctx context.Context, containerNsPath, ifNameInNs, hostIfNam
 		return nil, errors.Join(err, fmt.Errorf("failed to roll interface %s back to the host: %w", ifNameInNs, rollbackErr))
 	}
 	return nil, err
+}
+
+// pendingSubinterface is a subinterface that came up with addressing "SLAAC"
+// and whose autoconfigured address has not been waited for yet. Unlike a moved
+// interface, a new child has nothing to roll back to the host, so all of a
+// Pod's children are brought up first and waited for together: router
+// advertisements for one rail do not wait on another, and a Pod with one child
+// per RDMA NIC gets its addresses in the time one of them takes instead of the
+// sum, which a serial wait per device cannot fit in the runtime's request.
+type pendingSubinterface struct {
+	deviceName  string
+	config      DeviceConfig
+	vrfTable    int
+	networkData *resourceapi.NetworkDeviceData
+	status      *resourceapply.AllocatedDeviceStatusApplyConfiguration
+}
+
+// slaacResult is the outcome of the wait for one pending subinterface: the
+// autoconfigured addresses, or the reason there are none.
+type slaacResult struct {
+	addresses []string
+	err       error
+}
+
+// awaitSubinterfacesSLAAC waits for every pending subinterface to finish IPv6
+// autoconfiguration, all at once, within what is left of the request once
+// `reserve` is set aside for deleting them, and returns one result per pending
+// subinterface in the same order. If any of them fails while the runtime is
+// still waiting for the request, it deletes all of them: the sandbox fails and
+// the kubelet's retry creates them again. After the deadline it leaves them, as
+// awaitSLAACReady does with a moved interface.
+func awaitSubinterfacesSLAAC(ctx context.Context, containerNsPath string, pending []*pendingSubinterface, limit, reserve time.Duration) ([]slaacResult, error) {
+	logger := klog.FromContext(ctx)
+	containerNs, err := netns.GetFromPath(containerNsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container network namespace %s: %w", containerNsPath, err)
+	}
+	defer containerNs.Close()
+
+	budget, deadlineExceeded := readinessBudget(ctx, limit, reserve)
+	waitCtx := ctx
+	if deadlineExceeded {
+		logger.Info("Request deadline passed before IPv6 autoconfiguration of the subinterfaces; waiting anyway", "subinterfaces", len(pending), "budget", budget)
+		waitCtx = context.WithoutCancel(ctx)
+	}
+
+	results := make([]slaacResult, len(pending))
+	var wg sync.WaitGroup
+	for i, p := range pending {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			addresses, err := waitForSLAAC(waitCtx, containerNs, p.networkData.InterfaceName, budget)
+			results[i] = slaacResult{addresses: addresses, err: err}
+		}()
+	}
+	wg.Wait()
+
+	failed := false
+	for _, r := range results {
+		if r.err != nil {
+			failed = true
+			break
+		}
+	}
+	if !failed || deadlineExceeded {
+		return results, nil
+	}
+
+	var deleteErrs []error
+	for _, p := range pending {
+		if err := nsDeleteSubinterface(containerNsPath, p.networkData.InterfaceName); err != nil {
+			deleteErrs = append(deleteErrs, fmt.Errorf("failed to delete subinterface %s after IPv6 autoconfiguration failed: %w", p.networkData.InterfaceName, err))
+		}
+	}
+	return results, errors.Join(deleteErrs...)
 }

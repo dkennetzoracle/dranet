@@ -38,6 +38,23 @@ const (
 	MaxInterfaceNameLen = 15
 )
 
+// UnmarshalConfig unmarshals the NetworkConfig from a runtime.RawExtension as
+// written, without applying defaults. Use it for a configuration that
+// ValidateConfig has accepted and that is merged with the cloud provider
+// configuration afterwards: defaults that depend on the interface type, such
+// as the SLAAC ones, have to be applied to the merged configuration, where the
+// provider may have set the type.
+func UnmarshalConfig(raw *runtime.RawExtension) (*NetworkConfig, error) {
+	if raw == nil || len(raw.Raw) == 0 {
+		return nil, nil
+	}
+	var config NetworkConfig
+	if err := json.UnmarshalCaseSensitivePreserveInts(raw.Raw, &config); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON data: %w", err)
+	}
+	return &config, nil
+}
+
 // ValidateConfig unmarshals and validates the NetworkConfig from a runtime.RawExtension.
 // It performs strict unmarshalling and then defaults and validates the result via Validate.
 // Returns the parsed NetworkConfig and a slice of errors if any validation fails.
@@ -173,12 +190,16 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	// SLAAC owns the interface's IPv6 addressing, so nothing else may configure
 	// it; IPv4 has no autoconfiguration to conflict with, so IPv4 addresses are
-	// still allowed. Only the passthrough path waits for the autoconfigured
-	// address and rolls the interface back if none arrives, so it is the only
-	// path that offers it.
+	// still allowed.
 	if cfg.Addressing == AddressingModeSLAAC {
-		if cfg.IsSubinterface() {
-			allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' is not supported for subinterface types (type: %s)", fieldPath, AddressingModeSLAAC, cfg.Type))
+		if cfg.DisableIPv6 != nil && *cfg.DisableIPv6 {
+			allErrors = append(allErrors, fmt.Errorf("%s.disableIPv6: true disables IPv6 and cannot be combined with addressing '%s'", fieldPath, AddressingModeSLAAC))
+		}
+		// An IPVLAN child shares its parent's hardware address: EUI-64 gives it
+		// the parent's own addresses, and no link-local address means it never
+		// solicits a router advertisement.
+		if cfg.IsSubinterface() && cfg.AddrGenMode != nil && (*cfg.AddrGenMode == 0 || *cfg.AddrGenMode == 1) {
+			allErrors = append(allErrors, fmt.Errorf("%s.addrGenMode: %d cannot be combined with addressing '%s' on a subinterface (type: %s), which shares its parent's hardware address; use 2 or 3", fieldPath, *cfg.AddrGenMode, AddressingModeSLAAC, cfg.Type))
 		}
 		for i, addr := range cfg.Addresses {
 			prefix, err := netip.ParsePrefix(addr)
@@ -260,6 +281,10 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, fmt.Errorf("%s.dadTransmits: must not be negative, got %d", fieldPath, *cfg.DADTransmits))
 	}
 
+	if cfg.AddrGenMode != nil && (*cfg.AddrGenMode < 0 || *cfg.AddrGenMode > 3) {
+		allErrors = append(allErrors, fmt.Errorf("%s.addrGenMode: must be between 0 and 3, got %d", fieldPath, *cfg.AddrGenMode))
+	}
+
 	if cfg.RouterSolicitationDelay != nil && *cfg.RouterSolicitationDelay < 0 {
 		allErrors = append(allErrors, fmt.Errorf("%s.routerSolicitationDelay: must not be negative, got %d", fieldPath, *cfg.RouterSolicitationDelay))
 	}
@@ -279,6 +304,8 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 				{"acceptRA", cfg.AcceptRA != nil},
 				{"dadTransmits", cfg.DADTransmits != nil},
 				{"routerSolicitationDelay", cfg.RouterSolicitationDelay != nil},
+				{"disableIPv6", cfg.DisableIPv6 != nil},
+				{"addrGenMode", cfg.AddrGenMode != nil},
 			} {
 				if requested.set {
 					allErrors = append(allErrors, fmt.Errorf("%s.%s: requires an mtu of at least %d, got %d", fieldPath, requested.field, MinIPv6MTU, *cfg.MTU))
@@ -464,6 +491,7 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 		config.Interface.Forwarding != nil || config.Interface.ARPIgnore != nil ||
 		config.Interface.ARPAnnounce != nil || config.Interface.AcceptRA != nil ||
 		config.Interface.DADTransmits != nil || config.Interface.RouterSolicitationDelay != nil ||
+		config.Interface.DisableIPv6 != nil || config.Interface.AddrGenMode != nil ||
 		config.Interface.VRF != nil || config.Interface.IPVlan != nil {
 		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
 	}

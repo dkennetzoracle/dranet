@@ -197,7 +197,7 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 	// the kernel creates no IPv6 settings, so none of accept_ra, dad_transmits
 	// or router_solicitation_delay can be set.
 	if config.HasIPv6Sysctls() && config.MTU == nil && parentLink.Attrs().MTU < apis.MinIPv6MTU {
-		return nil, fmt.Errorf("the IPv6 settings (acceptRA, dadTransmits, routerSolicitationDelay) require an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
+		return nil, fmt.Errorf("the IPv6 settings (acceptRA, dadTransmits, routerSolicitationDelay, disableIPv6, addrGenMode) require an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
 	}
 
 	// Make sure the parent link is up on the host, otherwise subinterfaces cannot transmit traffic.

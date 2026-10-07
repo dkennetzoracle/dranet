@@ -1477,6 +1477,64 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 			},
 		},
 		{
+			// The addresses come from router advertisements; the merged config
+			// gets the SLAAC defaults an IPVLAN child needs.
+			name: "SLAAC subinterface is allowed without addresses",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-slaac", Namespace: "default", Name: "claim-subif-slaac"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-slaac"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN", Addressing: apis.AddressingModeSLAAC}}, true
+				}
+			},
+			wantPodConfig: &PodConfig{
+				DeviceConfigs: map[string]DeviceConfig{
+					"net-dev-0": {
+						Claim: types.NamespacedName{
+							Namespace: "default",
+							Name:      "claim-subif-slaac",
+						},
+						DeviceSnapshot: &resourcev1.Device{Name: "net-dev-0"},
+						NetworkInterfaceConfigInHost: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name: "dummy0",
+							},
+						},
+						NetworkInterfaceConfigInPod: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name:                    "dummy0",
+								Type:                    "IPVLAN",
+								Addressing:              apis.AddressingModeSLAAC,
+								AcceptRA:                ptr.To[int32](2),
+								RouterSolicitationDelay: ptr.To[int32](0),
+								DisableIPv6:             ptr.To(false),
+								AddrGenMode:             ptr.To[int32](3),
+								IPVlan:                  &apis.IPVlanConfig{Mode: apis.IPVlanModeL2, Flag: apis.IPVlanFlagBridge},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "provider-selected subinterface rejects a user hardwareAddr",
 			claim: &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-hwaddr", Namespace: "default", Name: "claim-subif-hwaddr"},
