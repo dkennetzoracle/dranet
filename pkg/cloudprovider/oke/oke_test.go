@@ -487,12 +487,21 @@ func TestGetDeviceConfig(t *testing.T) {
 			want:         profile,
 		},
 		{
-			name:         "IPv6 fabric gets no profile",
+			name:         "IPv6 fabric gets the profile",
 			ifName:       "rdma0",
 			pciAddress:   "0000:0c:00.0",
 			hardwareType: unix.ARPHRD_ETHER,
 			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
 			id:           rdma0ID,
+			want:         profile,
+		},
+		{
+			name:         "VCN interface on an IPv6 fabric node gets no profile",
+			ifName:       "eth0",
+			pciAddress:   "0000:0c:00.0",
+			hardwareType: unix.ARPHRD_ETHER,
+			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			id:           cloudprovider.DeviceIdentifiers{Name: "eth0", PCIAddress: "0000:0c:00.0"},
 		},
 		{
 			name:         "unnamed RDMA NIC with an OCA address gets the profile",
@@ -838,11 +847,51 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr: "fabric data is not available yet",
 		},
 		{
-			name:     "IPv6 fabric",
+			// The rail routers advertise a prefix per RDMA NIC per host, so the
+			// child autoconfigures its own address next to the parent's.
+			name:     "IPv6 fabric gets an IPvlan child with SLAAC",
 			config:   profileConfig(apis.InterfaceConfig{}),
 			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}, PrimaryVNIC: testVNIC()},
 			ifName:   "rdma0",
-			wantErr:  "IPv6 RDMA fabric",
+			want: &apis.NetworkConfig{Interface: apis.InterfaceConfig{
+				Type:         apis.InterfaceTypeIPVLAN,
+				Addressing:   apis.AddressingModeSLAAC,
+				DADTransmits: ptr.To[int32](0),
+			}},
+		},
+		{
+			name:     "IPv6 fabric without primary VNIC metadata",
+			config:   profileConfig(apis.InterfaceConfig{}),
+			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			ifName:   "rdma0",
+			want: &apis.NetworkConfig{Interface: apis.InterfaceConfig{
+				Type:         apis.InterfaceTypeIPVLAN,
+				Addressing:   apis.AddressingModeSLAAC,
+				DADTransmits: ptr.To[int32](0),
+			}},
+		},
+		{
+			name:     "IPv6 fabric rejects claim addresses",
+			config:   profileConfig(apis.InterfaceConfig{Addresses: []string{"fdcd:10:36ee:501b::d1/64"}}),
+			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			ifName:   "rdma0",
+			wantErr:  "remove interface.addresses",
+		},
+		{
+			name:     "IPv6 fabric rejects passthrough",
+			config:   profileConfig(apis.InterfaceConfig{Type: apis.InterfaceTypePassthrough}),
+			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			ifName:   "rdma0",
+			wantErr:  "does not move an RDMA NIC into a pod",
+		},
+		{
+			name:         "IPv6 fabric requires an Ethernet parent",
+			config:       profileConfig(apis.InterfaceConfig{}),
+			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			ifName:       "rdma0",
+			hardwareType: unix.ARPHRD_INFINIBAND,
+			netnsMode:    "Y",
+			wantErr:      "requires an Ethernet parent",
 		},
 		{
 			name:     "missing primary VNIC",
@@ -3313,4 +3362,43 @@ func TestStartReadsVNICSubnetsPerClaim(t *testing.T) {
 	read(time.Hour, 2, true)
 	read(0, 3, false, "10.140.64.0/19", "10.140.128.0/17")
 	read(time.Hour, 3, false, "10.140.64.0/19", "10.140.128.0/17")
+}
+
+// The configuration the driver applies on an IPv6 fabric, after it merges the
+// device configuration, the profile and the defaults, is an IPvlan child with
+// every setting an OKE pod needs for SLAAC: the OCI VCN-Native CNI disables
+// IPv6 in the pod namespace, and the child shares its parent's MAC address.
+func TestIPv6FabricMergedConfig(t *testing.T) {
+	fakeSysfs(t)
+	fakeInterface(t, "rdma0", "0000:0c:00.0", unix.ARPHRD_ETHER)
+	instance := newOKEInstance(&okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}}, nil)
+	instance.addressFallback = false
+	id := cloudprovider.DeviceIdentifiers{Name: "rdma0", PCIAddress: "0000:0c:00.0"}
+
+	merged := apis.MergeNetworkConfig(&apis.NetworkConfig{}, instance.GetDeviceConfig(id))
+	profile, err := instance.GetProfileConfig(id, nil, merged)
+	if err != nil {
+		t.Fatalf("GetProfileConfig() error: %v", err)
+	}
+	merged = apis.MergeNetworkConfig(merged, profile)
+	if errs := merged.Validate(); len(errs) > 0 {
+		t.Fatalf("merged configuration is invalid: %v", errs)
+	}
+	want := apis.InterfaceConfig{
+		Type:                       apis.InterfaceTypeIPVLAN,
+		Addressing:                 apis.AddressingModeSLAAC,
+		AcceptRA:                   ptr.To[int32](2),
+		DADTransmits:               ptr.To[int32](0),
+		RouterSolicitationDelay:    ptr.To[int32](0),
+		RouterSolicitationInterval: ptr.To[int32](1),
+		DisableIPv6:                ptr.To(false),
+		AddrGenMode:                ptr.To[int32](3),
+		IPVlan:                     merged.Interface.IPVlan,
+	}
+	if diff := cmp.Diff(want, merged.Interface); diff != "" {
+		t.Errorf("merged interface configuration mismatch (-want +got):\n%s", diff)
+	}
+	if len(merged.Routes) != 0 || len(merged.Rules) != 0 {
+		t.Errorf("merged configuration has routes %v and rules %v, want none: the router advertisement installs them", merged.Routes, merged.Rules)
+	}
 }
