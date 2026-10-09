@@ -40,7 +40,7 @@ spec:
                 -x NCCL_CUMEM_ENABLE=1 \
                 -x NCCL_IB_HCA==mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_5,mlx5_6,mlx5_7,mlx5_8 \
                 -x NCCL_NET_GDR_C2C=1 \
-                -x NCCL_IB_GID_INDEX=3 \
+                -x NCCL_IB_ADDR_FAMILY=AF_INET6 \
                 -x NCCL_IB_TC=41 \
                 -x NCCL_IB_SL=0 \
                 -x NCCL_IB_TIMEOUT=22 \

@@ -487,12 +487,21 @@ func TestGetDeviceConfig(t *testing.T) {
 			want:         profile,
 		},
 		{
-			name:         "IPv6 fabric gets no profile",
+			name:         "IPv6 fabric gets the profile",
 			ifName:       "rdma0",
 			pciAddress:   "0000:0c:00.0",
 			hardwareType: unix.ARPHRD_ETHER,
 			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
 			id:           rdma0ID,
+			want:         profile,
+		},
+		{
+			name:         "VCN interface on an IPv6 fabric node gets no profile",
+			ifName:       "eth0",
+			pciAddress:   "0000:0c:00.0",
+			hardwareType: unix.ARPHRD_ETHER,
+			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			id:           cloudprovider.DeviceIdentifiers{Name: "eth0", PCIAddress: "0000:0c:00.0"},
 		},
 		{
 			name:         "unnamed RDMA NIC with an OCA address gets the profile",
@@ -838,11 +847,30 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr: "fabric data is not available yet",
 		},
 		{
-			name:     "IPv6 fabric",
+			name:     "IPv6 fabric gets an unnumbered IPvlan child",
 			config:   profileConfig(apis.InterfaceConfig{}),
 			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}, PrimaryVNIC: testVNIC()},
 			ifName:   "rdma0",
-			wantErr:  "IPv6 RDMA fabric",
+			want: &apis.NetworkConfig{Interface: apis.InterfaceConfig{
+				Type:       apis.InterfaceTypeIPVLAN,
+				Addressing: apis.AddressingModeUnnumbered,
+			}},
+		},
+		{
+			name:     "IPv6 fabric rejects claim addresses",
+			config:   profileConfig(apis.InterfaceConfig{Addresses: []string{"fdcd:10:36ee:501b::d1/64"}}),
+			metadata: &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			ifName:   "rdma0",
+			wantErr:  "remove interface.addresses",
+		},
+		{
+			name:         "IPv6 fabric requires an Ethernet parent",
+			config:       profileConfig(apis.InterfaceConfig{}),
+			metadata:     &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}},
+			ifName:       "rdma0",
+			hardwareType: unix.ARPHRD_INFINIBAND,
+			netnsMode:    "Y",
+			wantErr:      "requires an Ethernet parent",
 		},
 		{
 			name:     "missing primary VNIC",
@@ -3313,4 +3341,28 @@ func TestStartReadsVNICSubnetsPerClaim(t *testing.T) {
 	read(time.Hour, 2, true)
 	read(0, 3, false, "10.140.64.0/19", "10.140.128.0/17")
 	read(time.Hour, 3, false, "10.140.64.0/19", "10.140.128.0/17")
+}
+
+// The configuration the driver applies on an IPv6 fabric, after it merges the
+// device configuration and the profile, is a valid IPvlan child without
+// addresses, which the kernel autoconfigures in a dual-stack pod.
+func TestIPv6FabricMergedConfig(t *testing.T) {
+	fakeSysfs(t)
+	fakeInterface(t, "rdma0", "0000:0c:00.0", unix.ARPHRD_ETHER)
+	instance := newOKEInstance(&okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true}}, nil)
+	instance.addressFallback = false
+	id := cloudprovider.DeviceIdentifiers{Name: "rdma0", PCIAddress: "0000:0c:00.0"}
+
+	merged := apis.MergeNetworkConfig(&apis.NetworkConfig{}, instance.GetDeviceConfig(id))
+	profile, err := instance.GetProfileConfig(id, nil, merged)
+	if err != nil {
+		t.Fatalf("GetProfileConfig() error: %v", err)
+	}
+	merged = apis.MergeNetworkConfig(merged, profile)
+	if errs := merged.Validate(); len(errs) > 0 {
+		t.Fatalf("merged configuration is invalid: %v", errs)
+	}
+	if merged.Interface.Type != apis.InterfaceTypeIPVLAN || merged.Interface.Addressing != apis.AddressingModeUnnumbered || len(merged.Interface.Addresses) != 0 {
+		t.Errorf("merged interface = %+v, want an unnumbered IPvlan child without addresses", merged.Interface)
+	}
 }

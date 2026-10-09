@@ -29,7 +29,7 @@ The profile needs these conditions:
 
 The profile rejects `interface.type: Passthrough`, DHCP, unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
-RDMA NICs on an IPv6 fabric get no profile and move into the pod as before.
+On an IPv6 fabric the child gets an autoconfigured address instead. See [IPv6 RDMA fabric](#ipv6-rdma-fabric).
 
 The profile needs `--profile-provider=cloud`, the default. With `webhook`, the webhook receives the `oke-rdma` profile and must resolve it itself. With `none` the profile is removed but the IPvlan type stays, so a claim needs its own `addresses` and the RDMA NIC stays on the host. The profile validation does not run under `none`, so a claim that sets `interface.type: Passthrough` explicitly moves the RDMA NIC into the pod, and the OCA routing of that RDMA NIC is not restored on return.
 
@@ -67,6 +67,27 @@ args:
 DRANET stops at startup when the value is not a valid range. DRANET also stops at startup when `--cloud-provider-hint` names a provider other than OKE. When auto-discovery selects another provider, DRANET ignores the option and logs a warning.
 
 Use the same range on all nodes that share one RDMA network. A child reaches other children through an on-link route for the range, so a child in an old range cannot reach a child in a new range. The `oke.dra.net/rdmaChildIpv4Cidr` attribute shows the configured range of each node. Prepared RDMA NICs keep the range that they started with, so drain the RDMA workloads before a change of the range.
+
+## IPv6 RDMA fabric
+
+On some shapes, for example BM.GPU.B300.8 and BM.GPU.GB200-v3.4, the RDMA NICs get their addresses from IPv6 Router Advertisements instead of from OCA. The `oke.dra.net/rdmaFabricIpv6` attribute is `true` on such a node. The rail routers advertise one `/64` prefix for each RDMA NIC of each host:
+
+```text
+rdma0  inet6 fdcd:10:66b0:a033:7625:54ff:feb5:c402/64 dynamic mngtmpaddr
+default via fe80::6e7a:63ff:fe73:1dcf dev rdma0 proto ra metric 1024
+```
+
+The `oke-rdma` profile resolves to an IPvlan child without addresses. The RDMA NIC stays on the host with its address. In the pod, the kernel autoconfigures the child from the Router Advertisements: an address in the prefix of the RDMA NIC, a RoCE v2 GID for that address, and a default route through the rail router. The kernel derives the interface identifier of the child from the MAC address of the RDMA NIC and the IPvlan device ID, so the child address differs from the address of the RDMA NIC. The profile adds no routes or rules. The claims are the same as on an IPv4 fabric.
+
+The child needs IPv6 in the pod network namespace, as in a dual-stack cluster. In an IPv4-only cluster the OCI VCN-Native CNI disables IPv6 in the pod namespace, and the child gets no address.
+
+The kernel autoconfigures the child after the containers start. Duplicate address detection holds the address for about a second, so the address and its GID appear about two seconds after the containers start. A workload that opens the RDMA NICs before that does not find the GID. Wait for the addresses before you start NCCL, for example:
+
+```sh
+until [ "$(ip -6 -o addr show scope global -tentative | grep -c ' rdma')" -ge "$EXPECTED_RDMA_NICS" ]; do sleep 0.1; done
+```
+
+For NCCL, set `NCCL_IB_ADDR_FAMILY=AF_INET6` and do not set `NCCL_IB_GID_INDEX`. With the default `AF_INET`, NCCL finds no IPv4 GID and uses GID index 0, the link-local GID of the parent, which a pod cannot use: the queue pair setup fails with `ibv_modify_qp ... No such device`. The pod network carries the NCCL bootstrap (`NCCL_SOCKET_IFNAME=eth0`).
 
 ## Native InfiniBand RDMA NICs
 

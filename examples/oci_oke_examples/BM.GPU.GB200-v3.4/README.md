@@ -82,12 +82,14 @@ OCI Instance Metadata Service (`GET /opc/v2/host/`):
 
 The ConnectX-8 NICs use **RoCEv2** (RDMA over Converged Ethernet v2). On OKE,
 each RDMA NIC receives a globally-routable IPv6 address via Router Advertisement.
-This address populates a routable GID in the NIC's GID table, which NCCL uses
-for inter-node communication (`NCCL_IB_GID_INDEX=3`).
+A claim gives the pod an IPvlan child of each RDMA NIC, and the kernel
+autoconfigures the child with its own address and RoCE v2 GID from the same
+Router Advertisements. The child's GID index differs from the parent's, so the
+jobs set `NCCL_IB_ADDR_FAMILY=AF_INET6` and let NCCL pick the GID instead of
+setting `NCCL_IB_GID_INDEX`.
 
-For NCCL to use the routable GID, the RDMA NICs in the pod must carry the
-RA-assigned IPv6 address (not just a link-local GID). Ensure your cluster /
-node configuration leaves IPv6 enabled on the RDMA interfaces inside pods.
+The child needs IPv6 enabled in the pod network namespace, as in a dual-stack
+cluster. See [IPv6 RDMA fabric](https://dranet.sigs.k8s.io/docs/user/oci-oke-rdma/#ipv6-rdma-fabric).
 
 **NCCL configuration note:** Set `NCCL_IB_DATA_DIRECT=0` to prevent NCCL from
 selecting the Data Direct DMA interface (`mlx5_N_dma`) and instead use the

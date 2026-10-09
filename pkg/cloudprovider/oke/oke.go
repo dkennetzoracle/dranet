@@ -408,20 +408,15 @@ func ocidSuffix(s string) (string, error) {
 }
 
 // GetDeviceConfig advertises the OKE profile with the IPvlan type for an
-// Ethernet RDMA NIC, so the RDMA NIC never moves into a pod. An RDMA NIC on an IPv6
-// fabric gets no profile and moves into the pod as before, because the
-// profile has no IPv6 support yet. A native InfiniBand NIC gets the profile
-// only when a claim would take it from the host, so GetProfileConfig fails
-// that claim.
+// Ethernet RDMA NIC, on an IPv4 and on an IPv6 fabric, so the RDMA NIC never
+// moves into a pod. A native InfiniBand NIC gets the profile only when a claim
+// would take it from the host, so GetProfileConfig fails that claim.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
 	if infiniBandHostError(id) != nil {
 		return &apis.NetworkConfig{Profile: okeRDMAProfile}
 	}
 	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
 	if err != nil || !o.isRDMANic(ifName) {
-		return nil
-	}
-	if metadata := o.metadata.Load(); metadata != nil && metadata.RDMAFabric != nil && metadata.RDMAFabric.IPv6 {
 		return nil
 	}
 	return &apis.NetworkConfig{
@@ -453,7 +448,7 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	case metadata == nil || metadata.RDMAFabric == nil:
 		return nil, errors.New("OKE RDMA fabric data is not available yet")
 	case metadata.RDMAFabric.IPv6:
-		return nil, errors.New("the OKE profile does not support an IPv6 RDMA fabric yet")
+		return ipv6ProfileConfig(id)
 	case metadata.PrimaryVNIC == nil:
 		return nil, errors.New("OKE primary VNIC metadata is not available yet")
 	}
@@ -601,6 +596,38 @@ func validateOKEProfileRequest(iface *apis.InterfaceConfig) error {
 		return errors.New("the OKE profile assigns the child address; remove interface.addresses")
 	}
 	return nil
+}
+
+// ipv6ProfileConfig resolves the OKE profile on an IPv6 RDMA fabric of a
+// dual-stack cluster. There the rail routers advertise a prefix for each RDMA
+// NIC of each host, and the pod namespace keeps IPv6 and router advertisements
+// enabled, so an IPvlan child without addresses autoconfigures its own address
+// in the prefix of its parent and the kernel gives it its own RoCE v2 GID. The
+// kernel derives the interface identifier of an IPvlan child from the parent's
+// MAC address and the child's dev_id, so it differs from the parent's.
+//
+// The child gets its address after the pod starts, after duplicate address
+// detection, so a workload that opens the RDMA NIC at once may not find the
+// GID yet. On a cluster whose pod namespace disables IPv6, the child gets no
+// address at all.
+func ipv6ProfileConfig(id cloudprovider.DeviceIdentifiers) (*apis.NetworkConfig, error) {
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil {
+		return nil, err
+	}
+	hardwareType, err := interfaceHardwareType(ifName)
+	if err != nil {
+		return nil, err
+	}
+	if hardwareType != unix.ARPHRD_ETHER {
+		return nil, fmt.Errorf("the OKE profile requires an Ethernet parent, but %s has ARPHRD type %d", ifName, hardwareType)
+	}
+	return &apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{
+			Type:       apis.InterfaceTypeIPVLAN,
+			Addressing: apis.AddressingModeUnnumbered,
+		},
+	}, nil
 }
 
 // resolveRDMANicIndex returns the RDMA NIC index from the rdmaN name, or
