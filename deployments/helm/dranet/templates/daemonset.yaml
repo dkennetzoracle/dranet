@@ -97,6 +97,9 @@ spec:
             {{- if .Values.args.slaacRollbackReserve }}
             - --slaac-rollback-reserve={{ .Values.args.slaacRollbackReserve }}
             {{- end }}
+            {{- if .Values.args.uplinkInterfaces }}
+            - {{ printf "--uplink-interfaces=%s" .Values.args.uplinkInterfaces | quote }}
+            {{- end }}
             {{- if (hasKey .Values.args "featureGates") }}
             - {{ printf "--feature-gates=%s" .Values.args.featureGates | quote }}
             {{- end }}

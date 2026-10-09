@@ -41,6 +41,7 @@ args: {}
 #  webhookURL: ""
 #  slaacReadyTimeout: "1500ms"
 #  slaacRollbackReserve: "500ms"
+#  uplinkInterfaces: ""
 #  featureGates: ""
 
 # kubeletRootDir is the kubelet data directory (its --root-dir). The driver's

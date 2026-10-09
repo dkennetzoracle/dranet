@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -73,6 +74,7 @@ var (
 	kubeletRootDir       string
 	slaacReadyTimeout    time.Duration
 	slaacRollbackReserve time.Duration
+	uplinkInterfaces     string
 
 	ready atomic.Bool
 )
@@ -93,6 +95,7 @@ func init() {
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.DurationVar(&slaacReadyTimeout, "slaac-ready-timeout", driver.DefaultSLAACReadyTimeout, "How long to wait for an interface using 'addressing: SLAAC' to pick up an address from IPv6 router advertisements inside the Pod, before taking the interface back out of the Pod (back to the host, or deleted for a subinterface) and failing the sandbox. While the container runtime's request is live the wait is capped by its deadline minus the rollback reserve; once that deadline has passed the wait runs for this full value and an interface without an address is left in the Pod.")
 	flag.DurationVar(&slaacRollbackReserve, "slaac-rollback-reserve", driver.DefaultSLAACRollbackReserve, "The least time a SLAAC wait leaves of the container runtime's request for taking the interface back out of the Pod if no address arrives. For a moved interface the wait uses the larger of this and the time that interface's own move took, since moving it back costs about as much.")
+	flag.StringVar(&uplinkInterfaces, "uplink-interfaces", "", "Comma-separated names of the host's uplink interfaces, which are kept out of the inventory along with their children. Replaces the automatic detection from the default routes. Set this on fabrics where the RDMA NICs receive a default route of their own, for example from IPv6 Router Advertisements: detection cannot tell those apart from a management uplink and excludes the whole fabric. Names that do not exist on a node are ignored, so one list can name the uplink of every node shape in the cluster; if none of them exist on a node, detection runs there instead.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 	flag.Var(&cloudProviderOptions, "cloud-provider-options", "A <provider>.<option>=<value> pair for a cloud provider. Repeat the flag for each option. Values can contain commas. The options of a provider apply only when that provider runs. Values must not contain secrets; flags are logged.")
 
@@ -243,6 +246,15 @@ func main() {
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
 		inventory.WithMaxPollInterval(maxPollInterval),
 		inventory.WithMoveIBInterfaces(moveIBInterfaces),
+	}
+	if uplinkInterfaces != "" {
+		names := []string{}
+		for _, name := range strings.Split(uplinkInterfaces, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				names = append(names, name)
+			}
+		}
+		optsDb = append(optsDb, inventory.WithUplinkInterfaces(names))
 	}
 	if features.DefaultFeatureGate.Enabled(features.DRAListTypeAttributes) {
 		optsDb = append(optsDb, inventory.WithListNUMAAttributes())
