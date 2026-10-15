@@ -133,6 +133,50 @@ values from the initial network namespace, subject to `net.core.devconf_inherit_
 The IPv6 values start at the kernel defaults (`accept_ra` is 1) unless that sysctl is 1 or 3.
 DRANET only changes the per-interface value.
 
+##### SLAAC addressing
+
+`interface.addressing: SLAAC` configures a passthrough interface from the IPv6 router
+advertisement of its link, the way `DHCP` configures it from a DHCP server. During
+NodePrepareResources DRANET sends a router solicitation on the host interface and waits up to
+5 seconds for an advertisement. The first advertisement with a usable prefix gives the Pod:
+
+* An address in each advertised prefix that is autonomous, on-link, a /64, and not deprecated.
+  The interface identifier is a hash of the prefix, the claim UID, and the device name, so the
+  address is the same each time the claim is prepared, and differs for each device.
+* A default route through the advertising router, when the advertisement has a non-zero
+  router lifetime.
+* IPv4 addresses from `addresses`, or else the host's global IPv4 addresses, as for a Static
+  passthrough interface. The host's IPv4 routes are copied, but not its IPv6 routes.
+
+DRANET applies the result once, as static configuration, when the Pod starts. The Pod does not
+process router advertisements: SLAAC sets `acceptRA` to 0 and rejects any other value. It also
+rejects IPv6 addresses in `addresses`, an `mtu` below 1280, and subinterface types.
+
+```yaml
+config:
+- opaque:
+    driver: dra.net
+    parameters:
+      interface:
+        addressing: "SLAAC"
+```
+
+* The host interface needs IPv6 enabled, but it does not need to autoconfigure itself. Prepare
+  fails at once when IPv6 is disabled on it or its MTU is below 1280, and after 5 seconds when
+  no usable advertisement arrives. The error gives the last reason.
+* The lifetimes in the advertisement are not tracked. The address and route stay until the Pod
+  ends, and a later advertisement, from another router or with a new prefix, does not change
+  them. Other advertisement options, such as the MTU, routes, and DNS servers, are ignored.
+* Duplicate address detection runs as the kernel default, so the address is tentative for a
+  second or two after the Pod starts. A failed detection is not reported.
+* Some CNI plugins disable IPv6 in the Pod network namespace of an IPv4-only cluster. DRANET
+  enables it on the interface and on `lo`, through which the Pod reaches its own addresses, and
+  leaves the namespace defaults as they are.
+* DRANET installs one IPv6 default route per routing table, and skips the default routes of
+  further SLAAC interfaces in the same table. Give each SLAAC interface of a Pod with several
+  its own VRF (`interface.vrf`), whose table then holds its default route. The interface keeps
+  its IPv6 addresses when it joins the VRF.
+
 ##### IPVLAN subinterfaces
 
 An `IPVLAN` subinterface is created inside the Pod network namespace on top of the
@@ -159,11 +203,12 @@ config:
         arpAnnounce: 2
 ```
 
-Two settings are not supported for subinterfaces and are rejected by validation:
+These settings are not supported for subinterfaces and are rejected by validation:
 
 * `hardwareAddr`: the child always uses the parent MAC address.
 * DHCP addressing: unsupported and untested. The DHCP client runs on the host parent
   interface before the subinterface exists.
+* SLAAC addressing: not supported yet.
 
 #### Route Configuration (RouteConfig)
 
