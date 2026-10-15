@@ -95,6 +95,16 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC},
 			want:            true,
 		},
+		{
+			name:            "vrf with an IPv6 address",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"2001:db8::1/64"}, VRF: &apis.VRFConfig{Name: "vrf0"}},
+			want:            true,
+		},
+		{
+			name:            "vrf with only IPv4 addresses",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}, VRF: &apis.VRFConfig{Name: "vrf0"}},
+			want:            false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -148,6 +158,14 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 			name:            "nothing requested",
 			interfaceConfig: apis.InterfaceConfig{Name: "rdma0"},
 			want:            map[string]int{},
+		},
+		{
+			name: "vrf with an IPv6 address keeps it on down",
+			interfaceConfig: apis.InterfaceConfig{
+				Addresses: []string{"192.0.2.1/24", "2001:db8::1/64"},
+				VRF:       &apis.VRFConfig{Name: "vrf0"},
+			},
+			want: map[string]int{"net/ipv6/conf/rdma0/keep_addr_on_down": 1},
 		},
 		{
 			name:            "slaac enables IPv6 on the interface and lo",
