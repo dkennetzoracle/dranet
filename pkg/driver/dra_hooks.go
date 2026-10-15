@@ -378,6 +378,34 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if lease != nil {
 			deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
 		}
+	} else if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC {
+		// Like DHCP: solicit the router advertisement on the host interface
+		// and apply the configuration it yields in the Pod.
+		klog.V(2).Infof("trying to get IPv6 configuration via SLAAC")
+		contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		prefixes, routes, err := getSLAAC(contextCancel, ifName)
+		if err != nil {
+			return fmt.Errorf("fail to get configuration via SLAAC for %s: %w", ifName, err)
+		}
+		iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
+		// IPv4 has no autoconfiguration: without addresses in the claim, the
+		// interface keeps the host's, as a Static passthrough interface does.
+		if len(iface.Addresses) == 0 {
+			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_V4)
+			if err != nil {
+				return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
+			}
+			for _, address := range nlAddresses {
+				if address.Scope == unix.RT_SCOPE_UNIVERSE {
+					iface.Addresses = append(iface.Addresses, address.IPNet.String())
+				}
+			}
+		}
+		for _, prefix := range prefixes {
+			iface.Addresses = append(iface.Addresses, slaacAddress(prefix, string(claim.UID), result.Device).String())
+		}
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 	} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
 		// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
 		// get the existing IP addresses
@@ -433,6 +461,12 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
 		if err != nil {
 			return err
+		}
+		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeSLAAC {
+			// The router advertisement gave the IPv6 routes; the host's may be
+			// stale or missing, so only its IPv4 routes, and the rules of their
+			// tables, are copied.
+			routes, tables = ipv4Routes(routes)
 		}
 		clearStaleRouteSources(routes, deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
 		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
@@ -736,6 +770,22 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 		}
 	}
 	return routes, tables, nil
+}
+
+// ipv4Routes returns the IPv4 routes among routes and the tables they use.
+func ipv4Routes(routes []apis.RouteConfig) ([]apis.RouteConfig, sets.Set[int]) {
+	var kept []apis.RouteConfig
+	tables := sets.Set[int]{}
+	for _, route := range routes {
+		if ip, _, err := net.ParseCIDR(route.Destination); err != nil || ip.To4() == nil {
+			continue
+		}
+		kept = append(kept, route)
+		if route.Table > 0 {
+			tables.Insert(route.Table)
+		}
+	}
+	return kept, tables
 }
 
 // clearStaleRouteSources drops the preferred source of copied host routes when

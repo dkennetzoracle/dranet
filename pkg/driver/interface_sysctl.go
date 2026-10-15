@@ -34,7 +34,8 @@ var sysctlProvider = sysctl.New
 
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil
+	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil ||
+		interfaceConfig.Addressing == apis.AddressingModeSLAAC
 }
 
 func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
@@ -65,6 +66,18 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 			errorList = append(errorList, fmt.Errorf("failed to set %s: IPv6 is not enabled on the interface: %w", name, err))
 		default:
 			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
+		}
+	}
+	// An interface takes the IPv6 default of the namespace it moves into, and
+	// some CNI plugins disable IPv6 in the Pod namespace of an IPv4-only
+	// cluster, lo included. The SLAAC addresses need it on this interface, and
+	// on lo, through which the Pod reaches its own addresses. Last, so that
+	// accept_ra is already 0: enabling IPv6 must not start the kernel's own
+	// autoconfiguration.
+	if interfaceConfig.Addressing == apis.AddressingModeSLAAC {
+		set("ipv6", "disable_ipv6", 0)
+		if err := sysctlInterface.SetSysctl("net/ipv6/conf/lo/disable_ipv6", 0); err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to set net/ipv6/conf/lo/disable_ipv6: %w", err))
 		}
 	}
 	return errors.Join(errorList...)

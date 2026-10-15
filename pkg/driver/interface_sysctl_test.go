@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -89,6 +90,11 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{ARPIgnore: ptr.To[int32](0), ARPAnnounce: ptr.To[int32](0)},
 			want:            true,
 		},
+		{
+			name:            "slaac",
+			interfaceConfig: apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC},
+			want:            true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,6 +149,15 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{Name: "rdma0"},
 			want:            map[string]int{},
 		},
+		{
+			name:            "slaac enables IPv6 on the interface and lo",
+			interfaceConfig: apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC, AcceptRA: ptr.To[int32](0)},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/accept_ra":    0,
+				"net/ipv6/conf/rdma0/disable_ipv6": 0,
+				"net/ipv6/conf/lo/disable_ipv6":    0,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,6 +169,32 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 				t.Errorf("applyInterfaceSysctlsWithSysctl() settings mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// recordingSysctl records the order of the settings it writes.
+type recordingSysctl struct {
+	*sysctltesting.Fake
+	order []string
+}
+
+func (r *recordingSysctl) SetSysctl(setting string, value int) error {
+	r.order = append(r.order, setting)
+	return r.Fake.SetSysctl(setting, value)
+}
+
+// SLAAC enables IPv6 only once accept_ra is 0, so that the kernel never starts
+// its own autoconfiguration on the interface.
+func TestApplyInterfaceSysctlsWithSysctlSLAACOrder(t *testing.T) {
+	sysctls := &recordingSysctl{Fake: sysctltesting.NewFake()}
+	interfaceConfig := apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC, AcceptRA: ptr.To[int32](0)}
+	if err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig); err != nil {
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error: %v", err)
+	}
+	acceptRA := slices.Index(sysctls.order, "net/ipv6/conf/rdma0/accept_ra")
+	enable := slices.Index(sysctls.order, "net/ipv6/conf/rdma0/disable_ipv6")
+	if acceptRA < 0 || enable < 0 || acceptRA > enable {
+		t.Errorf("applyInterfaceSysctlsWithSysctl() wrote %v, want accept_ra before disable_ipv6", sysctls.order)
 	}
 }
 
