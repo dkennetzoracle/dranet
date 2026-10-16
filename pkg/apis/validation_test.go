@@ -563,6 +563,78 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: true,
 			errCount:  2,
 		},
+		{
+			name:      "slaac on a passthrough interface",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "slaac keeps IPv4 addresses from the claim",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, Addresses: []string{"10.0.0.1/24"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "slaac with an IPv6 address",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, Addresses: []string{"10.0.0.1/24", "2001:db8::1/64"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "slaac with acceptRA",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, AcceptRA: ptr.To[int32](2)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "slaac with an IPv4-mapped IPv6 address",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, Addresses: []string{"::ffff:10.0.0.1/104"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "slaac with acceptRA 0",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "slaac with the deprecated dhcp field",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, DHCP: ptr.To(true)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "slaac below the IPv6 minimum mtu",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, MTU: ptr.To[int32](MinIPv6MTU - 1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "slaac below the IPv6 minimum mtu with acceptRA 0",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, MTU: ptr.To[int32](MinIPv6MTU - 1), AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "slaac at the IPv6 minimum mtu",
+			cfg:       &InterfaceConfig{Addressing: AddressingModeSLAAC, MTU: ptr.To[int32](MinIPv6MTU)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "slaac on an ipvlan subinterface",
+			cfg:       &InterfaceConfig{Type: "IPVLAN", Addressing: AddressingModeSLAAC},
+			fieldPath: "iface",
+			expectErr: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1261,6 +1333,15 @@ func TestNetworkConfigValidate(t *testing.T) {
 			},
 			expectedCfg: &NetworkConfig{
 				Interface: InterfaceConfig{Name: "eth0", DHCP: ptr.To(true), Addressing: AddressingModeDHCP},
+			},
+		},
+		{
+			name: "slaac accepts no router advertisements in the pod",
+			config: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC},
+			},
+			expectedCfg: &NetworkConfig{
+				Interface: InterfaceConfig{Name: "eth0", Addressing: AddressingModeSLAAC, AcceptRA: ptr.To[int32](0)},
 			},
 		},
 		{

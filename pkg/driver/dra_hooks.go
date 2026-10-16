@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/filter"
+	"sigs.k8s.io/dranet/pkg/internal/slaac"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
 	"github.com/Mellanox/rdmamap"
@@ -364,7 +365,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	}
 
 	// Resolve the addressing mode on the host, before the interface is handed
-	// to the Pod. A dynamic mode (DHCP) runs its exchange here and the
+	// to the Pod. A dynamic mode (DHCP, SLAAC) runs its exchange here and the
 	// result is configured statically in the Pod; nothing is applied in the
 	// root namespace.
 	podIface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
@@ -382,6 +383,41 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if lease != nil {
 			deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
 		}
+	case apis.AddressingModeSLAAC:
+		// The kernel keeps no IPv6 addresses below this MTU. Without an mtu the
+		// Pod interface keeps the host's, or the child inherits its parent's.
+		if podIface.MTU == nil && link.Attrs().MTU < apis.MinIPv6MTU {
+			return fmt.Errorf("addressing %s requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.AddressingModeSLAAC, apis.MinIPv6MTU, ifName, link.Attrs().MTU)
+		}
+		// Autoconfiguration covers IPv6 only. A passthrough interface with no
+		// IPv4 addresses in the claim keeps the host's, as it does without
+		// SLAAC; the autoconfigured addresses replace its host IPv6 ones.
+		if !podIface.IsSubinterface() && len(podIface.Addresses) == 0 {
+			hostAddresses, err := hostGlobalAddresses(nlHandle, link, netlink.FAMILY_V4)
+			if err != nil {
+				return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
+			}
+			podIface.Addresses = append(podIface.Addresses, hostAddresses...)
+		}
+		// The same claim and device always get the same addresses, and an
+		// IPVLAN child, which shares its parent's hardware address, does not
+		// get the parent's.
+		id := slaac.StableIdentifier(string(claim.UID), result.Device)
+		klog.V(2).Infof("trying to get IPv6 network configuration via SLAAC on %s", ifName)
+		slaacCtx, cancel := context.WithTimeout(ctx, slaacTimeout)
+		defer cancel()
+		addresses, routes, err := getSLAAC(slaacCtx, ifName, id)
+		if err != nil {
+			return fmt.Errorf("fail to get configuration via SLAAC for %s: %w", ifName, err)
+		}
+		// The claim status holds a bounded number of addresses, as the kernel
+		// bounds the addresses it autoconfigures (max_addresses).
+		if room := max(resourceapi.NetworkDeviceDataMaxIPs-len(podIface.Addresses), 0); len(addresses) > room {
+			klog.V(2).Infof("SLAAC on %s: keeping %d of the %d advertised addresses, the most a claim reports: %v", ifName, room, len(addresses), addresses[room:])
+			addresses = addresses[:room]
+		}
+		podIface.Addresses = append(podIface.Addresses, addresses...)
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 	default:
 		// For a passthrough interface with no custom addresses, use the
 		// existing ones.
@@ -428,7 +464,14 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 
 	// For non-subinterface type, obtain the routes and rules associated with the interface.
 	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-		routes, tables, err := getRouteInfo(nlHandle, ifName, link, netlink.FAMILY_ALL)
+		// With SLAAC the advertisement owns the IPv6 configuration: it replaces
+		// the host's IPv6 addresses, and so its IPv6 routes too, which may go
+		// through gateways only those addresses reach.
+		family := netlink.FAMILY_ALL
+		if podIface.Addressing == apis.AddressingModeSLAAC {
+			family = netlink.FAMILY_V4
+		}
+		routes, tables, err := getRouteInfo(nlHandle, ifName, link, family)
 		if err != nil {
 			return err
 		}
@@ -470,14 +513,14 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	}
 
 	// A subinterface has no host addresses to inherit, so its addresses must
-	// come from the user config, a profile, or be explicitly waived via
+	// come from the user config, a profile, SLAAC, or be explicitly waived via
 	// Addressing: Unnumbered. Routing (including any policy based routing) is
-	// owned by the user or the provider profile; the driver never synthesizes
-	// routes or rules.
+	// owned by the user, the provider profile, or the router advertisement of
+	// SLAAC; the driver synthesizes no other routes or rules.
 	if deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
 		iface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
 		if len(iface.Addresses) == 0 && iface.Addressing != apis.AddressingModeUnnumbered {
-			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing: Unnumbered", result.Device, iface.Type)
+			return fmt.Errorf("device %s: interface type %q resolved with no addresses; set interface.addresses, reference a profile that allocates them, or set interface.addressing to SLAAC or Unnumbered", result.Device, iface.Type)
 		}
 		if iface.Addressing == apis.AddressingModeUnnumbered {
 			klog.V(2).Infof("device %s: unnumbered %s interface requested; skipping address and route configuration", result.Device, iface.Type)

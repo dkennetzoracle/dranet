@@ -167,7 +167,7 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, validateSubinterfaceOnlyConfig(cfg, fieldPath)...)
 	}
 
-	if !slices.Contains([]AddressingMode{"", AddressingModeStatic, AddressingModeDHCP, AddressingModeUnnumbered}, cfg.Addressing) {
+	if !slices.Contains([]AddressingMode{"", AddressingModeStatic, AddressingModeDHCP, AddressingModeSLAAC, AddressingModeUnnumbered}, cfg.Addressing) {
 		allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' is not supported", fieldPath, cfg.Addressing))
 	}
 
@@ -183,6 +183,23 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		}
 		if len(cfg.Addresses) > 0 {
 			allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' cannot be set together with addresses", fieldPath, AddressingModeUnnumbered))
+		}
+	}
+
+	// SLAAC derives the IPv6 addresses from the router advertisement and
+	// applies them statically, so the claim cannot set them, and the Pod must
+	// not autoconfigure a second set from advertisements of its own.
+	if cfg.Addressing == AddressingModeSLAAC {
+		for i, addr := range cfg.Addresses {
+			if prefix, err := netip.ParsePrefix(addr); err == nil && prefix.Addr().Is6() {
+				allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: '%s' is an IPv6 address; addressing '%s' derives the IPv6 addresses from the router advertisement", fieldPath, i, addr, AddressingModeSLAAC))
+			}
+		}
+		if cfg.AcceptRA != nil && *cfg.AcceptRA != 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: must be 0 with addressing '%s', got %d", fieldPath, AddressingModeSLAAC, *cfg.AcceptRA))
+		}
+		if cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+			allErrors = append(allErrors, fmt.Errorf("%s.mtu: addressing '%s' requires an mtu of at least %d, got %d", fieldPath, AddressingModeSLAAC, MinIPv6MTU, *cfg.MTU))
 		}
 	}
 
@@ -239,7 +256,8 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 	}
 
 	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be set.
-	if cfg.AcceptRA != nil && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+	// SLAAC reports the mtu itself, since it defaults acceptRA.
+	if cfg.AcceptRA != nil && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU && cfg.Addressing != AddressingModeSLAAC {
 		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: requires an mtu of at least %d, got %d", fieldPath, MinIPv6MTU, *cfg.MTU))
 	}
 
