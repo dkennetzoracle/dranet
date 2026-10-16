@@ -59,7 +59,7 @@ type InterfaceConfig struct {
 	Type InterfaceType `json:"type,omitempty"`
 
 	// Addressing selects the IP address configuration strategy:
-	// "Static" (default), "DHCP", or "Unnumbered".
+	// "Static" (default), "DHCP", "SLAAC", or "Unnumbered".
 	// An empty value is treated as "Static".
 	Addressing AddressingMode `json:"addressing,omitempty"`
 
@@ -126,7 +126,8 @@ type InterfaceConfig struct {
 	// AcceptRA controls IPv6 router advertisement acceptance through
 	// /proc/sys/net/ipv6/conf/<iface>/accept_ra. Valid values are 0-2.
 	// Moving the interface resets it to the destination namespace default, so it
-	// must be requested explicitly.
+	// must be requested explicitly. Addressing SLAAC defaults it to 0 and
+	// accepts no other value.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
 
 	// VRF specifies the Virtual Routing and Forwarding domain this interface should belong to.
@@ -169,6 +170,14 @@ const (
 	AddressingModeStatic AddressingMode = "Static"
 	// AddressingModeDHCP obtains network configuration via DHCP.
 	AddressingModeDHCP AddressingMode = "DHCP"
+	// AddressingModeSLAAC obtains the IPv6 configuration from a Router
+	// Advertisement (RFC 4862), like DHCP: the driver solicits it on the host
+	// interface, the parent of a subinterface, when it prepares the claim, and
+	// configures the result statically in the Pod: an address in each
+	// autonomous /64 prefix, with an interface identifier derived from the
+	// claim and the device, and the advertised routes. IPv4 is configured as
+	// for Static.
+	AddressingModeSLAAC AddressingMode = "SLAAC"
 	// AddressingModeUnnumbered brings the interface up without driver configuring
 	// IP addresses or routes. Valid only for subinterfaces.
 	AddressingModeUnnumbered AddressingMode = "Unnumbered"

@@ -27,7 +27,7 @@ The profile needs these conditions:
 - The child range is large enough for the primary VNIC subnet. See [The child range](#the-child-range).
 - No VCN subnet, pod CIDR, or service CIDR uses the child range. For each claim, the provider checks the OCA RDMA network, every VNIC subnet of the node, every host route that overlaps the child range except the default route, and the Kubernetes service address. It cannot see the whole pod CIDR or service CIDR.
 
-The profile rejects `interface.type: Passthrough`, DHCP, unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
+The profile rejects `interface.type: Passthrough`, DHCP, SLAAC and unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
 A PCI function that carries several netdevs, one of them with an RDMA name, stays on the host on every fabric, and a claim for it fails. Such a function is, for example, the PF of a multi-planar rail with its plane netdevs, or a PF in switchdev mode with its VF representors. Claim a netdev with a PCI function of its own, such as a VF. The rail VFs of a multi-planar shape, `rdma_vf_rail<N>`, get the profile on an IPv6 fabric only: on an IPv4 fabric a claim for one fails. These refusals need `--profile-provider=cloud`, like the profile. With `none`, a claim for such a PCI function moves it into the pod.
 
