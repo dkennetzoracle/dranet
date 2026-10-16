@@ -48,6 +48,11 @@ type InterfaceConfig struct {
 	// If empty, it is treated as "Passthrough".
 	Type InterfaceType `json:"type,omitempty"`
 
+	// Addressing selects the IP address configuration strategy:
+	// "Static" (default), "DHCP", "SLAAC", or "Unnumbered".
+	// An empty value is treated as "Static".
+	Addressing AddressingMode `json:"addressing,omitempty"`
+
 	// Addresses is a list of IP addresses in CIDR format (e.g., "192.168.1.10/24")
 	// to be assigned to the interface.
 	Addresses []string `json:"addresses,omitempty"`
@@ -94,13 +99,15 @@ type InterfaceConfig struct {
 	// AcceptRA controls IPv6 router advertisement acceptance through
 	// /proc/sys/net/ipv6/conf/<iface>/accept_ra. Valid values are 0-2.
 	// Moving the interface resets it to the destination namespace default, so it
-	// must be requested explicitly.
+	// must be requested explicitly. Addressing SLAAC defaults it to 0 and
+	// accepts no other value.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
 }
 ```
 
 * **name** (string, optional): The logical name that the interface will have inside the Pod (e.g., "eth0", "enp0s3"). If not specified, DRANET will keep the original name if compliant.
 * **type** (string, optional): How the device is presented to the Pod. `Passthrough` (the default) moves the device into the Pod. `IPVLAN` keeps the device on the host and creates an IPVLAN subinterface on top of it inside the Pod.
+* **addressing** (string, optional): How the interface gets its IP configuration: `Static` (the default), `DHCP`, `SLAAC` or `Unnumbered`. See [Addressing modes](#addressing-modes).
 * **addresses** ([]string, optional): A list of IP addresses in CIDR format (e.g., "192.168.1.10/24", "2001:db8::1/64") to be assigned to the interface.
 * **mtu** (int32, optional): The Maximum Transmission Unit for the interface. For an `IPVLAN` subinterface the value must not exceed the parent MTU. When omitted, the child inherits the parent MTU.
 * **hardwareAddr** (string, optional): The MAC address of the interface. Passthrough only. An `IPVLAN` subinterface always uses its parent's MAC address, so the field is rejected.
@@ -133,6 +140,90 @@ values from the initial network namespace, subject to `net.core.devconf_inherit_
 The IPv6 values start at the kernel defaults (`accept_ra` is 1) unless that sysctl is 1 or 3.
 DRANET only changes the per-interface value.
 
+##### Addressing modes
+
+`addressing` selects where the interface's IP configuration comes from:
+
+* `Static` (default): the addresses in `addresses`, or the ones a cloud provider profile
+  resolves. A passthrough interface with neither keeps the global addresses it had on the host.
+* `DHCP`: an IPv4 address and the classless static routes (option 121) of a DHCP lease. The
+  lease is obtained on the host interface before it is handed to the Pod, and released when the
+  claim goes away. `addresses` must be empty.
+* `SLAAC`: the IPv6 configuration of the link's Router Advertisement, applied statically. See
+  [SLAAC addressing](#slaac-addressing).
+* `Unnumbered`: the interface is brought up without addresses or routes. Subinterfaces only.
+
+##### SLAAC addressing
+
+`addressing: SLAAC` configures the interface from the IPv6 Router Advertisement of its link, the
+way `DHCP` configures it from a DHCP lease. During NodePrepareResources DRANET sends Router
+Solicitations on the host interface, which for an `IPVLAN` child is its parent, and waits up to
+5 seconds, soliciting at 0, 1 and 3 seconds. From the first advertisement with a usable
+autonomous `/64` prefix, the Pod gets:
+
+* An address in each autonomous `/64` prefix that is not deprecated, with the prefix length when
+  the prefix is on-link and `/128` when it is not.
+* A link route for each on-link prefix it gets no address in.
+* The default route through the advertising router when it is a default router, and the more
+  specific routes it advertises (RFC 4191).
+* IPv4 as for `Static`: the IPv4 addresses in `addresses`, or else, for a passthrough interface,
+  the host's global IPv4 addresses. A passthrough interface also keeps its host IPv4 routes. Its
+  host IPv6 addresses and routes are not copied: the advertisement replaces them.
+
+The interface identifier is a hash of the claim UID and the device name. The address is the same
+each time the claim is prepared, differs for each claim and device, and does not depend on the
+MAC address, which an `IPVLAN` child shares with its parent.
+
+DRANET applies the result once, as static configuration, when the Pod starts. The Pod does not
+process router advertisements: SLAAC sets `acceptRA` to 0 and rejects any other value. It also
+rejects IPv6 addresses in `addresses`, `dhcp: true`, and an `mtu` below 1280. Without an `mtu`,
+prepare fails when the host interface has an MTU below 1280.
+
+```yaml
+config:
+- opaque:
+    driver: dra.net
+    parameters:
+      interface:
+        name: "net1"
+        addressing: "SLAAC"
+```
+
+* DRANET brings the host interface up if it is down. Where the host has IPv6 enabled on it, the
+  host kernel then also autoconfigures from the advertisement, until the interface moves into
+  the Pod, or for good on the parent of an `IPVLAN` child.
+* The host interface must be an Ethernet interface. The exchange uses a packet socket rather than
+  the host's IPv6 stack, so it works on a host interface with IPv6 disabled. A link without a
+  router, or whose routers hand out addresses through DHCPv6 (`M` flag without a prefix), fails
+  the claim after 5 seconds with an error that says so.
+* Any sender on the link can answer the solicitation, as with kernel SLAAC. DRANET only takes
+  advertisements that arrive on the host interface itself, not those of a VLAN on it, and not
+  those an `IPVLAN` child of it sends. Protect the fabric with RA Guard where other hosts or
+  Pods on the link are not trusted. Switch RA Guard does not see traffic between functions of
+  the same NIC, such as SR-IOV VFs of its PF: run untrusted Pods that get such functions without
+  `NET_RAW`, or filter advertisements on the NIC.
+* The lifetimes in the advertisement are not tracked. The addresses and routes stay until the
+  Pod ends, and a later advertisement, from another router or with a new prefix, does not change
+  them. The router that answered first is the Pod's only default router, even on a link with
+  several. A claim reports at most 16 addresses, so further prefixes get no address. The other fields of the advertisement, such as the MTU, the hop limit, the neighbor
+  discovery timers and DNS options, are ignored.
+* Duplicate address detection runs as the kernel default, so the address is tentative for a
+  second or two after the Pod starts. A failed detection is not reported.
+* Some CNI plugins disable IPv6 in the Pod network namespace of an IPv4-only cluster. DRANET
+  enables it on the interface, on `lo`, through which the Pod reaches its own addresses, and on
+  the interface's VRF device, and leaves the namespace defaults as they are.
+* DRANET does not replace a route the Pod's table already has to the same destination with the
+  same metric, and logs it instead at verbosity 4. In a dual-stack cluster the CNI's IPv6 default route through
+  `eth0` stays, and of several SLAAC interfaces only one, which one is not specified, gets its
+  default route; the others reach only their on-link prefixes and the routes their router
+  advertises. Without that conflict, the advertised default route carries all of the Pod's IPv6
+  traffic that has no more specific route, such as traffic to AAAA records.
+* To give each SLAAC interface its own default route, put it in its own VRF (`interface.vrf`):
+  its routes then go in the VRF's table, and the interface keeps its IPv6 addresses when it
+  joins the VRF. Applications must then bind to the VRF or the interface, with
+  `SO_BINDTODEVICE` or `ip vrf exec`, to use it; an unbound socket cannot reach it, nor bind to
+  its address.
+
 ##### IPVLAN subinterfaces
 
 An `IPVLAN` subinterface is created inside the Pod network namespace on top of the
@@ -164,6 +255,9 @@ Two settings are not supported for subinterfaces and are rejected by validation:
 * `hardwareAddr`: the child always uses the parent MAC address.
 * DHCP addressing: unsupported and untested. The DHCP client runs on the host parent
   interface before the subinterface exists.
+
+`SLAAC` addressing is supported. DRANET solicits the Router Advertisement on the parent, whose
+link the child shares, and the child gets an interface identifier of its own.
 
 #### Route Configuration (RouteConfig)
 
