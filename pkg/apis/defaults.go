@@ -2,6 +2,8 @@ package apis
 
 import (
 	"hash/fnv"
+
+	"k8s.io/utils/ptr"
 )
 
 // Default applies default values to the NetworkConfig.
@@ -23,6 +25,12 @@ func (c *InterfaceConfig) Default() {
 	// Fold the deprecated DHCP field into Addressing when Addressing is unset.
 	if c.Addressing == "" && c.DHCP != nil && *c.DHCP {
 		c.Addressing = AddressingModeDHCP
+	}
+	// SLAAC applies the advertised configuration statically. A Pod that also
+	// accepted router advertisements would autoconfigure a second address and
+	// default route, so it accepts none.
+	if c.Addressing == AddressingModeSLAAC && c.AcceptRA == nil {
+		c.AcceptRA = ptr.To[int32](0)
 	}
 }
 
