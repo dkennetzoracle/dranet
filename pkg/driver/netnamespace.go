@@ -96,7 +96,11 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 		if route.Source != "" {
 			r.Src = net.ParseIP(route.Source)
 		}
-		if err := nhNs.RouteAdd(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
+		if err := nhNs.RouteAdd(&r); errors.Is(err, syscall.EEXIST) {
+			// The table already has a route to the destination with the
+			// metric, such as one the kernel or the CNI added: that one stays.
+			klog.V(4).Infof("route %s for interface %s on namespace %s already exists, keeping the existing one", r.String(), ifName, containerNsPAth)
+		} else if err != nil {
 			errorList = append(errorList, fmt.Errorf("fail to add route %s for interface %s on namespace %s: %w", r.String(), ifName, containerNsPAth, err))
 		}
 
