@@ -76,6 +76,10 @@ cleanup_veth_interfaces() {
       ip link delete ipvlan-pbr-a || true
       ip link delete dhcp-cli || true
       iptables -w -D INPUT -i dhcp-srv -p udp --dport 67 -m statistic --mode nth --every 100 --packet 0 -j DROP 2>/dev/null || true
+      ip link delete slaac-cli || true
+      ip6tables -w -D INPUT -i slaac-rtr -p icmpv6 --icmpv6-type router-solicitation -m statistic --mode nth --every 100 --packet 0 -j DROP 2>/dev/null || true
+      ip6tables -w -D INPUT -i slaac-rtr -p icmpv6 --icmpv6-type router-solicitation 2>/dev/null || true
+      if [ -f /tmp/slaac-ipv6-forwarding ]; then sysctl -w net.ipv6.conf.all.forwarding="$(cat /tmp/slaac-ipv6-forwarding)"; rm -f /tmp/slaac-ipv6-forwarding; fi
     '
   done
 }
@@ -888,4 +892,62 @@ EOF
   run kubectl logs dhcp-server
   assert_success
   assert_output --partial "sending ACK"
+}
+
+@test "SLAAC ResourceClaim autoconfigures from a Router Advertisement when the router drops the first solicitation" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  # slaac-cli goes to the Pod, slaac-rtr stays on the node with radvd. The node
+  # has IPv6 disabled on slaac-cli, so it sends no solicitations of its own,
+  # and the exchange does not need the host's IPv6.
+  docker exec "$NODE_NAME" bash -c "ip link add slaac-cli type veth peer name slaac-rtr"
+  docker exec "$NODE_NAME" bash -c "sysctl -w net.ipv6.conf.slaac-cli.disable_ipv6=1"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev slaac-rtr"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev slaac-cli"
+  # radvd advertises itself as a default router only on a node that forwards
+  # IPv6, which a node of an IPv4-only kind cluster does not. The cleanup
+  # restores the setting.
+  docker exec "$NODE_NAME" bash -c "sysctl -n net.ipv6.conf.all.forwarding > /tmp/slaac-ipv6-forwarding && sysctl -w net.ipv6.conf.all.forwarding=1"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/radvd.yaml
+  wait_for_ready_pods app=radvd 90s
+  # radvd sends a few unsolicited advertisements when it starts, 16 s apart,
+  # and then one every few minutes. Wait them out, so that the driver can only
+  # get the answer to one of its solicitations.
+  sleep 40
+
+  # Count every Router Solicitation the router receives, and drop the first,
+  # so the driver has to retransmit.
+  docker exec "$NODE_NAME" bash -c "ip6tables -w -I INPUT -i slaac-rtr -p icmpv6 --icmpv6-type router-solicitation"
+  docker exec "$NODE_NAME" bash -c "ip6tables -w -A INPUT -i slaac-rtr -p icmpv6 --icmpv6-type router-solicitation -m statistic --mode nth --every 100 --packet 0 -j DROP"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_slaac.yaml
+  wait_for_ready_pods app=pod-slaac 60s
+
+  # The address is in the advertised prefix, with the prefix length of the
+  # on-link prefix, and is the one the claim status reports.
+  local ADDRESS
+  ADDRESS=$(kubectl get resourceclaims slaac-interface -o=jsonpath='{.status.devices[0].networkData.ips[*]}')
+  run echo "$ADDRESS"
+  assert_output --regexp '^2001:db8:5aac:[0-9a-f:]+/64$'
+  run kubectl exec pod-slaac -- ip -6 addr show dev eth99 scope global
+  assert_success
+  assert_output --partial "inet6 ${ADDRESS}"
+
+  # The Pod does not process router advertisements itself.
+  run kubectl exec pod-slaac -- cat /proc/sys/net/ipv6/conf/eth99/accept_ra
+  assert_output "0"
+
+  # The default route and the more specific route go through the router's
+  # link-local address.
+  run kubectl exec pod-slaac -- ip -6 route show dev eth99
+  assert_success
+  assert_output --regexp "default via fe80::[0-9a-f:]+"
+  assert_output --regexp "2001:db8:5aac:1::/64 via fe80::[0-9a-f:]+"
+
+  # The first solicitation was dropped, and a retransmission was answered.
+  run docker exec "$NODE_NAME" bash -c "ip6tables -w -L INPUT -v -n -x | awk '/slaac-rtr/ && /statistic/ {print \$1}'"
+  assert_output "1"
+  run docker exec "$NODE_NAME" bash -c "ip6tables -w -L INPUT -v -n -x | awk '/slaac-rtr/ && !/statistic/ {print \$1}'"
+  assert [ "$output" -ge 2 ]
 }
