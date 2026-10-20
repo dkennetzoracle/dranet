@@ -353,6 +353,23 @@ func TestIPv6ProfileConfig(t *testing.T) {
 			wantErr:   "needs acceptRA 0",
 		},
 		{
+			name:      "claim disableIPv6 false is accepted",
+			ifName:    "rdma_vf_rail3",
+			addresses: parent,
+			routers:   router,
+			config:    profileConfig(apis.InterfaceConfig{DisableIPv6: ptr.To(false)}),
+			wantChild: railChild,
+			wantTable: 119,
+		},
+		{
+			name:      "claim disableIPv6 true is rejected",
+			ifName:    "rdma_vf_rail3",
+			addresses: parent,
+			routers:   router,
+			config:    profileConfig(apis.InterfaceConfig{DisableIPv6: ptr.To(true)}),
+			wantErr:   "needs IPv6 enabled",
+		},
+		{
 			name:      "no global address yet",
 			ifName:    "rdma_vf_rail3",
 			addresses: parent[1:],
@@ -491,9 +508,10 @@ func TestIPv6ProfileConfig(t *testing.T) {
 			}
 
 			want := &apis.NetworkConfig{Interface: apis.InterfaceConfig{
-				Type:      apis.InterfaceTypeIPVLAN,
-				Addresses: []string{tt.wantChild + "/64"},
-				AcceptRA:  ptr.To[int32](0),
+				Type:        apis.InterfaceTypeIPVLAN,
+				Addresses:   []string{tt.wantChild + "/64"},
+				AcceptRA:    ptr.To[int32](0),
+				DisableIPv6: ptr.To(false),
 			}}
 			if tt.wantTable != 0 {
 				gateway := tt.wantRouter
