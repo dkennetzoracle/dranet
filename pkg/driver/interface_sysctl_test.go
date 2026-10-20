@@ -89,6 +89,11 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{ARPIgnore: ptr.To[int32](0), ARPAnnounce: ptr.To[int32](0)},
 			want:            true,
 		},
+		{
+			name:            "disable ipv6 false is requested",
+			interfaceConfig: apis.InterfaceConfig{DisableIPv6: ptr.To(false)},
+			want:            true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,6 +148,21 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{Name: "rdma0"},
 			want:            map[string]int{},
 		},
+		{
+			// A CNI disabled IPv6 in the Pod namespace, lo included.
+			name:            "enabling ipv6 enables lo too",
+			interfaceConfig: apis.InterfaceConfig{AcceptRA: ptr.To[int32](0), DisableIPv6: ptr.To(false)},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/accept_ra":    0,
+				"net/ipv6/conf/rdma0/disable_ipv6": 0,
+				"net/ipv6/conf/lo/disable_ipv6":    0,
+			},
+		},
+		{
+			name:            "disabling ipv6 leaves lo alone",
+			interfaceConfig: apis.InterfaceConfig{DisableIPv6: ptr.To(true)},
+			want:            map[string]int{"net/ipv6/conf/rdma0/disable_ipv6": 1},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,6 +174,44 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 				t.Errorf("applyInterfaceSysctlsWithSysctl() settings mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// orderRecordingSysctl records the order of the writes.
+type orderRecordingSysctl struct {
+	*sysctltesting.Fake
+	order []string
+}
+
+func (r *orderRecordingSysctl) SetSysctl(setting string, value int) error {
+	r.order = append(r.order, setting)
+	return r.Fake.SetSysctl(setting, value)
+}
+
+// Clearing disable_ipv6 starts the interface's IPv6 configuration with the
+// settings in place at that moment, so accept_ra has to be written first.
+func TestApplyInterfaceSysctlsWithSysctlEnablesIPv6Last(t *testing.T) {
+	sysctls := &orderRecordingSysctl{Fake: sysctltesting.NewFake()}
+	config := apis.InterfaceConfig{ARPIgnore: ptr.To[int32](1), AcceptRA: ptr.To[int32](0), DisableIPv6: ptr.To(false)}
+	if err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", config); err != nil {
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error: %v", err)
+	}
+	want := []string{
+		"net/ipv4/conf/rdma0/arp_ignore",
+		"net/ipv6/conf/rdma0/accept_ra",
+		"net/ipv6/conf/rdma0/disable_ipv6",
+		"net/ipv6/conf/lo/disable_ipv6",
+	}
+	if diff := cmp.Diff(want, sysctls.order); diff != "" {
+		t.Errorf("applyInterfaceSysctlsWithSysctl() write order mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestApplyInterfaceSysctlsWithSysctlReturnsLoopbackError(t *testing.T) {
+	sysctls := &failingSetSysctl{Fake: sysctltesting.NewFake(), setting: "net/ipv6/conf/lo/disable_ipv6"}
+	err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", apis.InterfaceConfig{DisableIPv6: ptr.To(false)})
+	if err == nil || !strings.Contains(err.Error(), "net/ipv6/conf/lo/disable_ipv6") {
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want the lo write error", err)
 	}
 }
 
@@ -213,6 +271,31 @@ func (e *erroringSetSysctl) SetSysctl(setting string, value int) error {
 
 // A missing accept_ra sysctl means the interface has no IPv6 settings. Zero is
 // then already satisfied; any other value is an error that names the cause.
+func TestApplyInterfaceSysctlsWithSysctlDisableIPv6NotExist(t *testing.T) {
+	const setting = "net/ipv6/conf/rdma0/disable_ipv6"
+	tests := []struct {
+		name    string
+		off     bool
+		wantErr string
+	}{
+		{name: "true with a missing sysctl is satisfied", off: true},
+		{name: "false with a missing sysctl fails", off: false, wantErr: "IPv6 cannot be enabled on it"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sysctls := &erroringSetSysctl{Fake: sysctltesting.NewFake(), setting: setting, err: os.ErrNotExist}
+			err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", apis.InterfaceConfig{DisableIPv6: ptr.To(tt.off)})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), setting) || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("applyInterfaceSysctlsWithSysctl() error = %v, want one naming %s and containing %q", err, setting, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestApplyInterfaceSysctlsWithSysctlAcceptRANotExist(t *testing.T) {
 	const setting = "net/ipv6/conf/rdma0/accept_ra"
 	tests := []struct {

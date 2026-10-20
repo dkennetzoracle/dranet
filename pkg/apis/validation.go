@@ -96,6 +96,23 @@ func (c *NetworkConfig) Validate() []error {
 		allErrors = append(allErrors, validateRoutes(c.Routes, "routes")...)
 	}
 
+	// IPv6 turned off on the interface leaves nothing to hold its IPv6 routes or
+	// neighbors, which the kernel then rejects when they are applied.
+	if off := c.Interface.DisableIPv6; off != nil && *off {
+		for _, route := range c.Routes {
+			if isIPv6(route.Destination) || isIPv6(route.Gateway) {
+				allErrors = append(allErrors, fmt.Errorf("interface.disableIPv6: true cannot be set together with the IPv6 route to %s", route.Destination))
+				break
+			}
+		}
+		for _, neighbor := range c.Neighbors {
+			if isIPv6(neighbor.Destination) {
+				allErrors = append(allErrors, fmt.Errorf("interface.disableIPv6: true cannot be set together with the IPv6 neighbor %s", neighbor.Destination))
+				break
+			}
+		}
+	}
+
 	// Validate Rules
 	if len(c.Rules) > 0 {
 		if c.Interface.VRF != nil {
@@ -236,6 +253,22 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	if cfg.AcceptRA != nil && (*cfg.AcceptRA < 0 || *cfg.AcceptRA > 2) {
 		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: must be between 0 and 2, got %d", fieldPath, *cfg.AcceptRA))
+	}
+
+	if cfg.DisableIPv6 != nil && *cfg.DisableIPv6 {
+		for _, address := range cfg.Addresses {
+			if prefix, err := netip.ParsePrefix(address); err == nil && prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+				allErrors = append(allErrors, fmt.Errorf("%s.disableIPv6: true cannot be set together with the IPv6 address %s", fieldPath, address))
+				break
+			}
+		}
+	}
+	if cfg.DisableIPv6 != nil && *cfg.DisableIPv6 && cfg.AcceptRA != nil && *cfg.AcceptRA != 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s.disableIPv6: true cannot be set together with acceptRA %d", fieldPath, *cfg.AcceptRA))
+	}
+	// The kernel creates no IPv6 settings below this MTU, so disable_ipv6 cannot be set either.
+	if cfg.DisableIPv6 != nil && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+		allErrors = append(allErrors, fmt.Errorf("%s.disableIPv6: requires an mtu of at least %d, got %d", fieldPath, MinIPv6MTU, *cfg.MTU))
 	}
 
 	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be set.
@@ -431,6 +464,7 @@ func ValidateRDMAOnlyConfig(raw *runtime.RawExtension) []error {
 		config.Interface.GROIPv4MaxSize != nil || config.Interface.DisableEBPFPrograms != nil ||
 		config.Interface.Forwarding != nil || config.Interface.ARPIgnore != nil ||
 		config.Interface.ARPAnnounce != nil || config.Interface.AcceptRA != nil ||
+		config.Interface.DisableIPv6 != nil ||
 		config.Interface.VRF != nil || config.Interface.IPVlan != nil {
 		allErrors = append(allErrors, fmt.Errorf("interface configuration is not supported for RDMA-only devices (no network interface present)"))
 	}
@@ -477,4 +511,13 @@ func validateNeighborConfig(neighbors []NeighborConfig, fieldPath string) (allEr
 		}
 	}
 	return allErrors
+}
+
+// isIPv6 reports whether s is an IPv6 address or prefix, not an IPv4-mapped one.
+func isIPv6(s string) bool {
+	if prefix, err := netip.ParsePrefix(s); err == nil {
+		return prefix.Addr().Is6() && !prefix.Addr().Is4In6()
+	}
+	addr, err := netip.ParseAddr(s)
+	return err == nil && addr.Is6() && !addr.Is4In6()
 }

@@ -658,3 +658,101 @@ func TestNsDeleteSubinterfaceMissingNamespace(t *testing.T) {
 		t.Fatalf("nsDeleteSubinterface() returned error for a missing namespace: %v", err)
 	}
 }
+
+// A CNI that disables IPv6 in the Pod namespace of an IPv4-only cluster, as the
+// OCI VCN-Native CNI does, disables it for all, default and lo. A child created
+// there takes the default, so its IPv6 address fails with EACCES, unless the
+// claim asks for disableIPv6: false.
+func TestSubinterface_IPVlanInIPv6DisabledNamespace(t *testing.T) {
+	userns.Run(t, testSubinterface_IPVlanInIPv6DisabledNamespace_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testSubinterface_IPVlanInIPv6DisabledNamespace_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, 1500)
+	env.inNS(t, func() {
+		for _, dev := range []string{"all", "default", "lo"} {
+			if err := sysctl.New().SetSysctl("net/ipv6/conf/"+dev+"/disable_ipv6", 1); err != nil {
+				t.Fatalf("failed to disable IPv6 on %s in the pod namespace: %v", dev, err)
+			}
+		}
+	})
+
+	config := apis.InterfaceConfig{
+		Name:      "dranet0",
+		Type:      apis.InterfaceTypeIPVLAN,
+		Addresses: []string{"2001:db8::3/64"},
+		AcceptRA:  ptr.To[int32](0),
+	}
+	if _, err := nsCreateSubinterface(env.parent, env.nsPath, config); err == nil || !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("nsCreateSubinterface() without disableIPv6 error = %v, want EACCES", err)
+	}
+	assertOnlyLoopback(t, env)
+
+	config.DisableIPv6 = ptr.To(false)
+	deviceData, err := nsCreateSubinterface(env.parent, env.nsPath, config)
+	if err != nil {
+		t.Fatalf("nsCreateSubinterface() with disableIPv6 false: %v", err)
+	}
+	if len(deviceData.IPs) != 1 || deviceData.IPs[0] != config.Addresses[0] {
+		t.Errorf("reported IPs %v, want %v", deviceData.IPs, config.Addresses)
+	}
+	env.inNS(t, func() {
+		for _, dev := range []string{config.Name, "lo"} {
+			got, err := sysctl.New().GetSysctl("net/ipv6/conf/" + dev + "/disable_ipv6")
+			if err != nil || got != 0 {
+				t.Errorf("%s disable_ipv6 = %d (%v), want 0", dev, got, err)
+			}
+		}
+		// The namespace defaults stay as the CNI set them.
+		if got, _ := sysctl.New().GetSysctl("net/ipv6/conf/default/disable_ipv6"); got != 1 {
+			t.Errorf("default disable_ipv6 = %d, want the CNI's 1", got)
+		}
+	})
+	nhNs, err := nlwrap.NewHandleAt(env.testNS)
+	if err != nil {
+		t.Fatalf("fail to open netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+	link, err := nhNs.LinkByName(config.Name)
+	if err != nil {
+		t.Fatalf("child %s not found: %v", config.Name, err)
+	}
+	addrs, err := nhNs.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		t.Fatalf("AddrList() error: %v", err)
+	}
+	if !slices.ContainsFunc(addrs, func(a netlink.Addr) bool { return a.IPNet.String() == config.Addresses[0] }) {
+		t.Errorf("child addresses %v do not include %s", addrs, config.Addresses[0])
+	}
+	// lo is enabled for the Pod to reach its own addresses: it has ::1 again.
+	lo, err := nhNs.LinkByName("lo")
+	if err != nil {
+		t.Fatalf("lo not found: %v", err)
+	}
+	loAddrs, err := nhNs.AddrList(lo, netlink.FAMILY_V6)
+	if err != nil {
+		t.Fatalf("AddrList(lo) error: %v", err)
+	}
+	if !slices.ContainsFunc(loAddrs, func(a netlink.Addr) bool { return a.IP.Equal(net.IPv6loopback) }) {
+		t.Errorf("lo addresses %v do not include ::1", loAddrs)
+	}
+}
+
+func TestSubinterface_IPVlanRejectsEnablingIPv6BelowIPv6MTU(t *testing.T) {
+	userns.Run(t, testSubinterface_IPVlanRejectsEnablingIPv6BelowIPv6MTU_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testSubinterface_IPVlanRejectsEnablingIPv6BelowIPv6MTU_Namespaced(t *testing.T) {
+	env := newIPVlanTestEnv(t, apis.MinIPv6MTU-1)
+	config := apis.InterfaceConfig{
+		Name:        "dranet0",
+		Type:        apis.InterfaceTypeIPVLAN,
+		Addresses:   []string{"192.0.2.3/32"},
+		DisableIPv6: ptr.To(false),
+	}
+	_, err := nsCreateSubinterface(env.parent, env.nsPath, config)
+	if err == nil || !strings.Contains(err.Error(), "disableIPv6: false requires an MTU of at least 1280") {
+		t.Fatalf("nsCreateSubinterface() error = %v, want an MTU error", err)
+	}
+	assertOnlyLoopback(t, env)
+}

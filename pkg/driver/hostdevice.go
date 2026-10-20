@@ -44,6 +44,9 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	if interfaceConfig.AcceptRA != nil && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
 		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
 	}
+	if off := interfaceConfig.DisableIPv6; off != nil && !*off && interfaceConfig.MTU == nil && hostDev.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("disableIPv6: false requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
+	}
 
 	// Devices can be renamed only when down
 	if err = netlink.LinkSetDown(hostDev); err != nil {

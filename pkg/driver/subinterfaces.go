@@ -198,6 +198,9 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, config apis
 	if config.AcceptRA != nil && config.MTU == nil && parentLink.Attrs().MTU < apis.MinIPv6MTU {
 		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
 	}
+	if off := config.DisableIPv6; off != nil && !*off && config.MTU == nil && parentLink.Attrs().MTU < apis.MinIPv6MTU {
+		return nil, fmt.Errorf("disableIPv6: false requires an MTU of at least %d, but parent interface %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, parentLink.Attrs().MTU)
+	}
 
 	// Make sure the parent link is up on the host, otherwise subinterfaces cannot transmit traffic.
 	if err := netlink.LinkSetUp(parentLink); err != nil {

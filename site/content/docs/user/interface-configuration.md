@@ -96,6 +96,10 @@ type InterfaceConfig struct {
 	// Moving the interface resets it to the destination namespace default, so it
 	// must be requested explicitly.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
+
+	// DisableIPv6 turns IPv6 off or on for the interface through
+	// /proc/sys/net/ipv6/conf/<iface>/disable_ipv6. false also enables it on lo.
+	DisableIPv6 *bool `json:"disableIPv6,omitempty"`
 }
 ```
 
@@ -111,6 +115,20 @@ type InterfaceConfig struct {
 * **arpIgnore** (int32, optional): Which ARP requests the interface answers. Valid values are 0, 1, 2, 3, and 8. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_ignore`.
 * **arpAnnounce** (int32, optional): The source address the interface uses in ARP requests, from 0 to 2. Sets `/proc/sys/net/ipv4/conf/<iface>/arp_announce`.
 * **acceptRA** (int32, optional): Whether the interface accepts IPv6 router advertisements. `0` rejects them, `1` accepts them when forwarding is off, and `2` accepts them also when forwarding is on. Sets `/proc/sys/net/ipv6/conf/<iface>/accept_ra`.
+* **disableIPv6** (bool, optional): Turns IPv6 off (`true`) or on (`false`) for the interface. Sets `/proc/sys/net/ipv6/conf/<iface>/disable_ipv6`; `false` also sets it on `lo`, through which the Pod reaches its own addresses.
+
+An interface takes the IPv6 default of the namespace it moves into or is created in. Some CNI
+plugins disable IPv6 in the Pod network namespaces of an IPv4-only cluster, `lo` included; the
+OCI VCN-Native CNI does. An IPv6 address on an interface there fails with `permission denied`
+unless the claim sets `disableIPv6: false`. DRANET writes it after `acceptRA` and before the
+addresses and the link come up. Pair it with `acceptRA: 0` unless the interface should
+autoconfigure: once IPv6 is on, the link otherwise takes the namespace's `accept_ra`, 1 by
+default. The namespace defaults stay as the CNI set them. With IPv6 on, `lo` has `::1` again, so
+clients of `localhost` in the Pod try `::1` before `127.0.0.1`.
+`disableIPv6: true` is rejected together with an IPv6 address in `addresses`, an IPv6 route or
+neighbor, or an `acceptRA` other than 0. Like `acceptRA`, `disableIPv6: false` needs an MTU of at
+least 1280, from `mtu` or from the host interface; `disableIPv6: true` on an interface without
+IPv6 settings is already satisfied.
 
 The kernel resets both ARP settings to the network namespace default when an interface
 moves into a Pod, so a value configured on the host does not survive the move and has to
