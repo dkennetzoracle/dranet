@@ -319,9 +319,10 @@ func testSubinterface_IPVlanIPv6SourceRouting_Namespaced(t *testing.T) {
 	// The shape the OKE profile returns for rdma_vf_rail3.
 	profile := &apis.NetworkConfig{
 		Interface: apis.InterfaceConfig{
-			Type:      apis.InterfaceTypeIPVLAN,
-			Addresses: []string{child + "/64"},
-			AcceptRA:  ptr.To[int32](0),
+			Type:        apis.InterfaceTypeIPVLAN,
+			Addresses:   []string{child + "/64"},
+			AcceptRA:    ptr.To[int32](0),
+			DisableIPv6: ptr.To(false),
 		},
 		Routes: []apis.RouteConfig{
 			{Destination: prefix, Scope: unix.RT_SCOPE_LINK, Table: table},

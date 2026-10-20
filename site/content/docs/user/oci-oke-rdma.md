@@ -41,6 +41,7 @@ On an IPv6 fabric (`oke.dra.net/rdmaFabricIpv6` is true) the rail routers advert
 
 - one address in the `/64` of the RDMA NIC. The interface identifier is a hash of the claim UID and the RDMA NIC name: a repeated prepare of the claim gets the same address, and the next claim on the RDMA NIC a new one, so it does not clash with a child of the previous claim that is still being torn down;
 - `acceptRA: 0`: the child ignores the router's advertisements, so the pod autoconfigures nothing next to that address. A claim that sets another `acceptRA` fails;
+- `disableIPv6: false`: IPv6 on for the child and `lo`, which a CNI may have disabled in the pod namespace of an IPv4-only cluster. A claim that sets `disableIPv6: true` fails. With IPv6 on, `lo` has `::1` again, so a client of `localhost` in the pod tries `::1` first;
 - a route table with a link route for the `/64` and the default route through the router of the RDMA NIC's IPv6 default route, and a source rule from the child address to that table. The table is 100 plus the index for `rdmaN` and 116 plus the index for `rdma_vf_rail<N>`.
 
 On an IPv6 fabric a claim with its own `routes` or `rules` owns the routing, but `interface.vrf` fails the claim: joining a VRF cycles the child, which then loses its static IPv6 address until the driver keeps it ([#390](https://github.com/kubernetes-sigs/dranet/pull/390)), and the per-rail tables already keep the rails apart.
@@ -51,9 +52,9 @@ The provider reads the `/64` and the router once, when it prepares the claim. Th
 
 On a multi-planar shape the PF of each rail shares its PCI function with the plane netdevs, `rdma_p<P>_rail<N>`, and an `rdmaN` netdev that can be the PF or the rail VF's representor. A claim for such a PCI function fails, as on every fabric: those netdevs stay on the host. Claim the rail VF.
 
-Every RDMA NIC's default route is `::/0`, which is why each one gets its own table: RoCE resolves a GID's peers with the GID's address as the source, which the rule sends to the table of its own RDMA NIC. Other traffic must use the child address as its source, as on an IPv4 fabric; a socket bound only to the interface finds no route. For NCCL set `NCCL_IB_ADDR_FAMILY=AF_INET6` and leave `NCCL_IB_GID_INDEX` unset: NCCL then selects the child's RoCE v2 GID. The address goes through duplicate address detection when the pod starts, so an application that binds to it within about a second can get `EADDRNOTAVAIL`.
+Every RDMA NIC's default route is `::/0`, which is why each one gets its own table: RoCE resolves a GID's peers with the GID's address as the source, which the rule sends to the table of its own RDMA NIC. Other traffic must use the child address as its source, as on an IPv4 fabric: the kernel finds no route for a socket bound only to the interface. For NCCL set `NCCL_IB_ADDR_FAMILY=AF_INET6` and leave `NCCL_IB_GID_INDEX` unset: NCCL then selects the child's RoCE v2 GID. The address goes through duplicate address detection when the pod starts, so an application that binds to it within about a second can get `EADDRNOTAVAIL`.
 
-The pod network namespace must have IPv6 enabled. A CNI that disables IPv6 there, as the OCI VCN-Native CNI does on an IPv4-only cluster, makes the address fail. The child range and the OCA files do not apply on an IPv6 fabric.
+No SLAAC runs and nothing in the pod needs IPv6 from the CNI, so this works on a single-stack IPv4 cluster too, including one whose CNI disables IPv6 in the pod namespace, as the OCI VCN-Native CNI does: the child and `lo` get IPv6 back, and the rest of the pod namespace stays as the CNI set it. The child range and the OCA files do not apply on an IPv6 fabric.
 
 ## The child range
 

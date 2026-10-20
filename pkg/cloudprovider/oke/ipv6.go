@@ -198,8 +198,8 @@ func isEthernetRailVF(ifName string) bool {
 // prefix or the rail router changes, the child keeps the old ones until the pod
 // is recreated.
 //
-// The pod namespace must have IPv6 enabled: a CNI that disables it there, as
-// the OCI VCN-Native CNI does on an IPv4-only cluster, makes the address fail.
+// It enables IPv6 on the child and on lo, which a CNI may have disabled in the
+// pod namespace of an IPv4-only cluster.
 func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	index, tableBase := 0, okeRDMASBRTableBase
 	if i, ok := rdmaNicIndex(ifName); ok {
@@ -216,10 +216,14 @@ func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.Resour
 	if claim == nil || claim.UID == "" {
 		return nil, fmt.Errorf("the OKE profile on an IPv6 fabric needs the claim UID to derive the address of the %s child", ifName)
 	}
-	// A claim value would win over the profile's and autoconfigure a second
-	// address, GID and default route on the child.
+	// A claim value would win over the profile's: another acceptRA
+	// autoconfigures a second address, GID and default route on the child, and
+	// disableIPv6 true leaves its address unconfigurable.
 	if ra := config.Interface.AcceptRA; ra != nil && *ra != 0 {
 		return nil, fmt.Errorf("the OKE profile on an IPv6 fabric configures the %s child itself and needs acceptRA 0; remove interface.acceptRA", ifName)
+	}
+	if off := config.Interface.DisableIPv6; off != nil && *off {
+		return nil, fmt.Errorf("the OKE profile on an IPv6 fabric gives the %s child an IPv6 address and needs IPv6 enabled; remove interface.disableIPv6", ifName)
 	}
 	// Joining a VRF cycles the interface, and the kernel removes its IPv6
 	// addresses on the way down unless keep_addr_on_down is set, which the
@@ -249,6 +253,11 @@ func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.Resour
 			// rail router's advertisements, and the child would autoconfigure a
 			// second address, GID and default route next to these.
 			AcceptRA: ptr.To[int32](0),
+			// A CNI that disables IPv6 in the pod namespace on an IPv4-only
+			// cluster, as the OCI VCN-Native CNI does, creates the child with
+			// IPv6 off, and adding its address fails with EACCES. The driver
+			// writes this after acceptRA, so enabling IPv6 starts nothing.
+			DisableIPv6: ptr.To(false),
 		},
 	}
 	// Routing is user-owned when the claim carries routes or rules.
