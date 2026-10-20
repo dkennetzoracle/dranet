@@ -170,6 +170,13 @@ func TestValidateConfig(t *testing.T) {
 		},
 		{
 			// The literal field name pins the JSON contract.
+			name:        "disableIPv6 parses under its JSON name",
+			raw:         &runtime.RawExtension{Raw: []byte(`{"interface":{"name":"eth0","disableIPv6":false}}`)},
+			expectErr:   false,
+			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(false)}},
+		},
+		{
+			// The literal field name pins the JSON contract.
 			name:        "acceptRA parses under its JSON name",
 			raw:         &runtime.RawExtension{Raw: []byte(`{"interface":{"name":"eth0","acceptRA":2}}`)},
 			expectErr:   false,
@@ -408,6 +415,45 @@ func TestValidateInterfaceConfig(t *testing.T) {
 		{
 			name:      "invalid arpAnnounce (negative)",
 			cfg:       &InterfaceConfig{Name: "eth0", ARPAnnounce: ptr.To[int32](-1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "disableIPv6 false with an IPv6 address",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(false), Addresses: []string{"fdcd::5/64"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "disableIPv6 true with only IPv4 addresses",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(true), Addresses: []string{"10.0.0.5/24"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "disableIPv6 true with an IPv6 address",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(true), Addresses: []string{"10.0.0.5/24", "fdcd::5/64"}},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "disableIPv6 true with acceptRA 1",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(true), AcceptRA: ptr.To[int32](1)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "disableIPv6 true with acceptRA 0",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(true), AcceptRA: ptr.To[int32](0)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "disableIPv6 with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(false), MTU: ptr.To[int32](1200)},
 			fieldPath: "iface",
 			expectErr: true,
 			errCount:  1,
@@ -1407,5 +1453,37 @@ func TestValidateConfigDelegatesToValidate(t *testing.T) {
 	}
 	if cfg.Interface.IPVlan.Mode != IPVlanModeL2 || cfg.Interface.IPVlan.Flag != IPVlanFlagBridge {
 		t.Errorf("ValidateConfig() ipvlan = %+v, want mode %s flag %s", cfg.Interface.IPVlan, IPVlanModeL2, IPVlanFlagBridge)
+	}
+}
+
+func TestValidateDisableIPv6WithIPv6RoutesAndNeighbors(t *testing.T) {
+	off := InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(true)}
+	tests := []struct {
+		name    string
+		cfg     NetworkConfig
+		wantErr string
+	}{
+		{name: "IPv4 route", cfg: NetworkConfig{Interface: off, Routes: []RouteConfig{{Destination: "10.0.0.0/8", Gateway: "10.0.0.1"}}}},
+		{name: "IPv6 destination", cfg: NetworkConfig{Interface: off, Routes: []RouteConfig{{Destination: "fdcd::/64"}}}, wantErr: "IPv6 route to fdcd::/64"},
+		{name: "IPv6 gateway", cfg: NetworkConfig{Interface: off, Routes: []RouteConfig{{Destination: "::/0", Gateway: "fe80::1"}}}, wantErr: "IPv6 route to ::/0"},
+		{name: "IPv6 neighbor", cfg: NetworkConfig{Interface: off, Neighbors: []NeighborConfig{{Destination: "fe80::1", HardwareAddr: "02:00:00:00:00:01"}}}, wantErr: "IPv6 neighbor fe80::1"},
+		{name: "IPv6 route with IPv6 enabled", cfg: NetworkConfig{Interface: InterfaceConfig{Name: "eth0", DisableIPv6: ptr.To(false)}, Routes: []RouteConfig{{Destination: "fdcd::/64"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var found error
+			for _, err := range tt.cfg.Validate() {
+				if strings.Contains(err.Error(), "disableIPv6") {
+					found = err
+				}
+			}
+			if tt.wantErr == "" {
+				if found != nil {
+					t.Fatalf("Validate() error = %v, want none about disableIPv6", found)
+				}
+			} else if found == nil || !strings.Contains(found.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", found, tt.wantErr)
+			}
+		})
 	}
 }

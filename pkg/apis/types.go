@@ -129,6 +129,17 @@ type InterfaceConfig struct {
 	// must be requested explicitly.
 	AcceptRA *int32 `json:"acceptRA,omitempty"`
 
+	// DisableIPv6 turns IPv6 off or on for the interface through
+	// /proc/sys/net/ipv6/conf/<iface>/disable_ipv6. An interface takes the
+	// destination namespace default when it moves or is created there, and some
+	// CNI plugins disable IPv6 in the Pod namespace on IPv4-only clusters, the
+	// OCI VCN-Native CNI among them, so an interface that needs IPv6 there has to
+	// request it explicitly. false also enables IPv6 on lo, through which the Pod
+	// reaches its own addresses. It is written after acceptRA and before the
+	// addresses and the link come up; pair false with acceptRA 0 unless the
+	// interface should autoconfigure.
+	DisableIPv6 *bool `json:"disableIPv6,omitempty"`
+
 	// VRF specifies the Virtual Routing and Forwarding domain this interface should belong to.
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.

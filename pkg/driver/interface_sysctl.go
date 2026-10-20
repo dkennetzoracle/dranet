@@ -37,7 +37,7 @@ var sysctlProvider = sysctl.New
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
 	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil ||
-		keepsIPv6AddressesInVRF(interfaceConfig)
+		keepsIPv6AddressesInVRF(interfaceConfig) || interfaceConfig.DisableIPv6 != nil
 }
 
 // keepsIPv6AddressesInVRF reports whether the interface joins a VRF with IPv6
@@ -83,6 +83,35 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 	}
 	if keepsIPv6AddressesInVRF(interfaceConfig) {
 		set("ipv6", "keep_addr_on_down", 1)
+	}
+	// Last, after accept_ra. The link is still down here in both callers, so the
+	// order changes nothing today; it keeps an interface that is already up from
+	// autoconfiguring with the namespace's accept_ra once IPv6 comes on. A CNI
+	// that disables IPv6 in the Pod namespace disables it on lo too, and the Pod
+	// reaches its own IPv6 addresses through lo, so enabling it on the interface
+	// enables it there as well.
+	if interfaceConfig.DisableIPv6 != nil {
+		name := fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", ifName)
+		value := 0
+		if *interfaceConfig.DisableIPv6 {
+			value = 1
+		}
+		err := sysctlInterface.SetSysctl(name, value)
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrNotExist) && value == 1:
+			// No IPv6 settings (an MTU below 1280): IPv6 is already off.
+			klog.V(4).Infof("%s not found; IPv6 is not enabled on %s and disableIPv6: true is already satisfied", name, ifName)
+		case errors.Is(err, os.ErrNotExist):
+			errorList = append(errorList, fmt.Errorf("failed to set %s: the interface has no IPv6 settings, so IPv6 cannot be enabled on it: %w", name, err))
+		default:
+			errorList = append(errorList, fmt.Errorf("failed to set %s: %w", name, err))
+		}
+		if value == 0 {
+			if err := sysctlInterface.SetSysctl("net/ipv6/conf/lo/disable_ipv6", 0); err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to set net/ipv6/conf/lo/disable_ipv6: %w", err))
+			}
+		}
 	}
 	return errors.Join(errorList...)
 }
