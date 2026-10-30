@@ -32,8 +32,11 @@ import (
 // getDefaultGwInterfaces returns a set of interface names that are configured
 // as active default gateways in the main routing table, respecting route metrics.
 // It identifies defaults as routes where Dst is nil (kernel default) or where
-// Dst is exactly 0.0.0.0/0 (IPv4) or ::/0 (IPv6).
-func getDefaultGwInterfaces() sets.Set[string] {
+// Dst is exactly 0.0.0.0/0 (IPv4) or ::/0 (IPv6). An interface for which
+// neverUplink, when not nil, returns true is skipped before the metrics are
+// compared, so its default routes neither make it an uplink nor shadow the
+// uplink's.
+func getDefaultGwInterfaces(neverUplink func(ifName string) bool) sets.Set[string] {
 	interfaces := make(sets.Set[string])
 
 	filter := &netlink.Route{
@@ -83,6 +86,10 @@ func getDefaultGwInterfaces() sets.Set[string] {
 				continue
 			}
 			name := intfLink.Attrs().Name
+			if neverUplink != nil && neverUplink(name) {
+				klog.V(4).Infof("Not treating %s as an uplink despite its default route: the cloud provider reports it is never the node's uplink", name)
+				continue
+			}
 
 			if r.Family == netlink.FAMILY_V4 {
 				if metric < minMetricV4 {
@@ -124,9 +131,10 @@ func getDefaultGwInterfaces() sets.Set[string] {
 // state; when the parent is the host's default-gw uplink this also degrades
 // host connectivity. There is no scenario where relocating only the child of
 // a default-gw uplink is correct, so the entire MasterIndex-linked subtree
-// rooted at each uplink should be excluded.
-func getExcludedUplinkInterfaces() sets.Set[string] {
-	excluded := getDefaultGwInterfaces()
+// rooted at each uplink should be excluded. neverUplink is passed to
+// getDefaultGwInterfaces.
+func getExcludedUplinkInterfaces(neverUplink func(ifName string) bool) sets.Set[string] {
+	excluded := getDefaultGwInterfaces(neverUplink)
 
 	links, err := nlwrap.LinkList()
 	if err != nil {

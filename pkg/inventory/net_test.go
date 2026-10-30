@@ -80,6 +80,7 @@ func testGetDefaultGwInterfaces_Namespaced(t *testing.T) {
 	tests := []struct {
 		name           string
 		setupRoutes    func() error
+		neverUplink    func(ifName string) bool
 		expectedResult sets.Set[string]
 	}{
 		{
@@ -217,6 +218,33 @@ func testGetDefaultGwInterfaces_Namespaced(t *testing.T) {
 			expectedResult: sets.New[string]("eth2"),
 		},
 		{
+			// An IPv4-only node on an IPv6 RDMA fabric: the rail routers advertise
+			// a default route on every RDMA NIC, at the kernel's RA metric.
+			name: "Interfaces the provider rules out are not uplinks",
+			setupRoutes: func() error {
+				if err := netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V4, Dst: defaultIPv4, Gw: gwIPv4, LinkIndex: links["eth0"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN}); err != nil {
+					return err
+				}
+				if err := netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth1"].Attrs().Index, Priority: 1024, Table: unix.RT_TABLE_MAIN}); err != nil {
+					return err
+				}
+				return netlink.RouteAppend(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth2"].Attrs().Index, Priority: 1024, Table: unix.RT_TABLE_MAIN})
+			},
+			neverUplink:    func(ifName string) bool { return ifName == "eth1" || ifName == "eth2" },
+			expectedResult: sets.New[string]("eth0"),
+		},
+		{
+			name: "An interface the provider rules out does not shadow the uplink",
+			setupRoutes: func() error {
+				if err := netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth1"].Attrs().Index, Priority: 100, Table: unix.RT_TABLE_MAIN}); err != nil {
+					return err
+				}
+				return netlink.RouteAdd(&netlink.Route{Family: netlink.FAMILY_V6, Dst: defaultIPv6, Gw: gwIPv6, LinkIndex: links["eth2"].Attrs().Index, Priority: 200, Table: unix.RT_TABLE_MAIN})
+			},
+			neverUplink:    func(ifName string) bool { return ifName == "eth1" },
+			expectedResult: sets.New[string]("eth2"),
+		},
+		{
 			name: "Ignores default routes in custom routing tables",
 			setupRoutes: func() error {
 				return netlink.RouteAdd(&netlink.Route{
@@ -247,7 +275,7 @@ func testGetDefaultGwInterfaces_Namespaced(t *testing.T) {
 				t.Fatalf("setupRoutes failed: %v", err)
 			}
 
-			got := getDefaultGwInterfaces()
+			got := getDefaultGwInterfaces(tt.neverUplink)
 			if diff := cmp.Diff(tt.expectedResult, got); diff != "" {
 				t.Errorf("getDefaultGwInterfaces() mismatch (-want +got):\n%s", diff)
 			}
@@ -363,7 +391,7 @@ func testGetExcludedUplinkInterfaces_Namespaced(t *testing.T) {
 
 			tt.setup(t)
 
-			got := getExcludedUplinkInterfaces()
+			got := getExcludedUplinkInterfaces(nil)
 			if diff := cmp.Diff(tt.expectedResult, got); diff != "" {
 				t.Errorf("getExcludedUplinkInterfaces() mismatch (-want +got):\n%s", diff)
 			}

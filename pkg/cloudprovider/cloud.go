@@ -42,6 +42,18 @@ type CloudInstance interface {
 	GetDeviceConfig(id DeviceIdentifiers) *apis.NetworkConfig
 }
 
+// UplinkFilter is an optional interface implemented by cloud providers that
+// know which host interfaces are never the node's uplink, even when they carry
+// a default route. The inventory excludes the default-gateway interfaces as
+// uplinks, and on an IPv6 RDMA fabric the rail routers advertise a default
+// route on every RDMA NIC: the RDMA NICs tie on metric, and without the filter
+// the whole fabric leaves the inventory.
+type UplinkFilter interface {
+	// IsNeverUplink reports whether ifName is never the node's uplink, so
+	// that its default routes do not make it one.
+	IsNeverUplink(ifName string) bool
+}
+
 // ProfileProvider is an optional interface implemented by cloud or webhook providers
 // that support on-demand, stateful network configurations based on user profiles.
 type ProfileProvider interface {

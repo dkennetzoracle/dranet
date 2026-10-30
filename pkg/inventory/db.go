@@ -202,7 +202,11 @@ func (db *DB) Run(ctx context.Context) error {
 		klog.Error(err, "error subscribing to netlink interfaces, only syncing periodically", "interval", db.maxPollInterval.String())
 	}
 
-	db.gwInterfaces = getExcludedUplinkInterfaces()
+	var neverUplink func(ifName string) bool
+	if filter, ok := db.instance.(cloudprovider.UplinkFilter); ok {
+		neverUplink = filter.IsNeverUplink
+	}
+	db.gwInterfaces = getExcludedUplinkInterfaces(neverUplink)
 	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
 
 	for {
