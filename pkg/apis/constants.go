@@ -35,6 +35,13 @@ const (
 	// tables (0, 253, 254, 255) and to identify DRANET managed tables.
 	RouteTableOffset = 1000
 
+	// SLAACRouteTableOffset is the offset of the routing tables that hold the
+	// routes of SLAAC interfaces. The table of an interface is the offset plus
+	// the index of its host interface, which for an IPVLAN child is its parent.
+	// The interfaces of a Pod are distinct host interfaces of one node, so their
+	// tables differ. It is above the tables of TableIDForName.
+	SLAACRouteTableOffset = 2 * RouteTableOffset
+
 	// SourceRoutingRulePriority is the priority for provider-generated source
 	// based routing rules. It must be lower than the kernel's implicit "main"
 	// table rule (32766) so matching traffic is routed via the interface's

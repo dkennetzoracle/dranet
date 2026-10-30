@@ -166,6 +166,8 @@ autonomous `/64` prefix, the Pod gets:
 * A link route for each on-link prefix it gets no address in.
 * The default route through the advertising router when it is a default router, and the more
   specific routes it advertises (RFC 4191).
+* A rule that sends the traffic from each of its IPv6 addresses to the routes above. See
+  [Routing](#slaac-routing).
 * IPv4 as for `Static`: the IPv4 addresses in `addresses`, or else, for a passthrough interface,
   the host's global IPv4 addresses. A passthrough interface also keeps its host IPv4 routes. Its
   host IPv6 addresses and routes are not copied: the advertisement replaces them.
@@ -212,17 +214,28 @@ config:
 * Some CNI plugins disable IPv6 in the Pod network namespace of an IPv4-only cluster. DRANET
   enables it on the interface, on `lo`, through which the Pod reaches its own addresses, and on
   the interface's VRF device, and leaves the namespace defaults as they are.
-* DRANET does not replace a route the Pod's table already has to the same destination with the
-  same metric, and logs it instead at verbosity 4. In a dual-stack cluster the CNI's IPv6 default route through
-  `eth0` stays, and of several SLAAC interfaces only one, which one is not specified, gets its
-  default route; the others reach only their on-link prefixes and the routes their router
-  advertises. Without that conflict, the advertised default route carries all of the Pod's IPv6
-  traffic that has no more specific route, such as traffic to AAAA records.
-* To give each SLAAC interface its own default route, put it in its own VRF (`interface.vrf`):
-  its routes then go in the VRF's table, and the interface keeps its IPv6 addresses when it
-  joins the VRF. Applications must then bind to the VRF or the interface, with
-  `SO_BINDTODEVICE` or `ip vrf exec`, to use it; an unbound socket cannot reach it, nor bind to
-  its address.
+
+###### SLAAC routing
+
+Each router advertises a default route, and a Pod can have several SLAAC interfaces, or, in a
+dual-stack cluster, the CNI's IPv6 default route through `eth0`. So the routes of each SLAAC
+interface go in a routing table of its own, table 2000 plus the index of the host interface (for
+an `IPVLAN` child, its parent's), with a link route for each prefix it has an address in. A rule
+at priority 32000 sends the traffic from each of its addresses to that table. The Pod's main
+table has only the link routes the kernel adds with the addresses.
+
+* Traffic from an interface's address uses that interface's router, and RoCE resolves the
+  peers of a GID through it, since it uses the GID's address as the source. Each SLAAC interface
+  of a Pod therefore reaches beyond its prefix, whatever the other interfaces or the CNI
+  configure.
+* Traffic without such a source uses the main table, so it does not go through a SLAAC
+  interface unless the destination is in one of its prefixes. An application that needs a
+  SLAAC interface's router must bind to its address. The IPv6 default route of the CNI, if
+  any, stays the Pod's default.
+* An interface in a VRF (`interface.vrf`) gets its routes in the VRF's table instead, and no
+  rule; applications must then bind to the VRF or the interface, with `SO_BINDTODEVICE` or
+  `ip vrf exec`.
+* Do not use the SLAAC tables, 2000 and above, for routes or rules of your own in the same Pod.
 
 ##### IPVLAN subinterfaces
 

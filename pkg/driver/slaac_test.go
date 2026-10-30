@@ -75,6 +75,77 @@ func slaacTestRoutes(router netip.Addr) []apis.RouteConfig {
 	}
 }
 
+// slaacTestSourceRouting is the routing the driver configures for a SLAAC
+// interface with address, the address slaacTestRA gives it in slaacTestPrefix,
+// whose host interface has index hostIndex.
+func slaacTestSourceRouting(address string, hostIndex int) ([]apis.RouteConfig, apis.RuleConfig) {
+	table := apis.SLAACRouteTableOffset + hostIndex
+	routes := []apis.RouteConfig{{Destination: slaacTestPrefix.String(), Scope: unix.RT_SCOPE_LINK, Table: table}}
+	for _, route := range slaacTestRoutes(slaacTestRouter) {
+		route.Table = table
+		routes = append(routes, route)
+	}
+	source := netip.MustParsePrefix(address).Addr()
+	return routes, apis.RuleConfig{Priority: apis.SourceRoutingRulePriority, Source: netip.PrefixFrom(source, 128).String(), Table: table}
+}
+
+func TestSLAACSourceRouting(t *testing.T) {
+	routes := slaacTestRoutes(slaacTestRouter)
+	table := apis.SLAACRouteTableOffset + 7
+	tests := []struct {
+		name       string
+		addresses  []string
+		inVRF      bool
+		wantRoutes []apis.RouteConfig
+		wantRules  []apis.RuleConfig
+	}{
+		{
+			name:      "a table of its own with a rule from the address",
+			addresses: []string{"192.0.2.10/24", "2001:db8::10/64"},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "2001:db8::/64", Scope: unix.RT_SCOPE_LINK, Table: table},
+				{Destination: "2001:db8:2::/64", Scope: unix.RT_SCOPE_LINK, Table: table},
+				{Destination: "::/0", Gateway: slaacTestRouter.String(), Table: table},
+				{Destination: "2001:db8:1::/48", Gateway: slaacTestRouter.String(), Table: table},
+			},
+			wantRules: []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: "2001:db8::10/128", Table: table}},
+		},
+		{
+			// An address in a prefix that is not on-link has no link route.
+			name:      "an address without its prefix on-link",
+			addresses: []string{"2001:db8::10/128"},
+			wantRoutes: []apis.RouteConfig{
+				{Destination: "2001:db8:2::/64", Scope: unix.RT_SCOPE_LINK, Table: table},
+				{Destination: "::/0", Gateway: slaacTestRouter.String(), Table: table},
+				{Destination: "2001:db8:1::/48", Gateway: slaacTestRouter.String(), Table: table},
+			},
+			wantRules: []apis.RuleConfig{{Priority: apis.SourceRoutingRulePriority, Source: "2001:db8::10/128", Table: table}},
+		},
+		{
+			// The driver puts the routes of an interface in a VRF in its table.
+			name:       "in a VRF",
+			addresses:  []string{"2001:db8::10/64"},
+			inVRF:      true,
+			wantRoutes: routes,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRoutes, gotRules := slaacSourceRouting(tt.addresses, routes, 7, tt.inVRF)
+			if diff := cmp.Diff(tt.wantRoutes, gotRoutes); diff != "" {
+				t.Errorf("routes mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.wantRules, gotRules); diff != "" {
+				t.Errorf("rules mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+	// The routes passed in are not changed.
+	if diff := cmp.Diff(slaacTestRoutes(slaacTestRouter), routes); diff != "" {
+		t.Errorf("slaacSourceRouting changed its input (-want +got):\n%s", diff)
+	}
+}
+
 func TestDescribeUnusableAdvertisement(t *testing.T) {
 	for name, tc := range map[string]struct {
 		ra   *slaac.RouterAdvertisement
@@ -469,6 +540,14 @@ func testPrepareResourceClaimSLAAC(t *testing.T) {
 			eventRecorder:  record.NewFakeRecorder(100),
 		}
 	}
+	hostIndex := func(t *testing.T) int {
+		t.Helper()
+		hostLink, err := netlink.LinkByName(link.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hostLink.Attrs().Index
+	}
 	prepare := func(t *testing.T, claim *resourcev1.ResourceClaim) DeviceConfig {
 		t.Helper()
 		np := newDriver()
@@ -499,15 +578,20 @@ func testPrepareResourceClaimSLAAC(t *testing.T) {
 		// The host IPv4 address is kept, the host IPv6 address is not: the
 		// autoconfigured one replaces it.
 		checkInterface(t, cfg, "claim-uid-slaac-passthrough", "192.0.2.10/24")
-		// The advertised routes come first, then the host's IPv4 routes.
-		// None of its IPv6 routes are copied, learned or static: the
-		// advertisement replaces the host's IPv6 configuration.
-		wantRoutes := append(slaacTestRoutes(slaacTestRouter),
+		// The advertised routes come first, in the interface's own table,
+		// then the host's IPv4 routes. None of its IPv6 routes are copied,
+		// learned or static: the advertisement replaces the host's IPv6
+		// configuration.
+		slaacRoutes, slaacRule := slaacTestSourceRouting(cfg.NetworkInterfaceConfigInPod.Interface.Addresses[1], hostIndex(t))
+		wantRoutes := append(slaacRoutes,
 			apis.RouteConfig{Destination: "192.0.2.0/24", Source: "192.0.2.10", Scope: unix.RT_SCOPE_LINK, Table: unix.RT_TABLE_MAIN},
 			apis.RouteConfig{Destination: "198.51.100.0/24", Gateway: "192.0.2.1", Table: unix.RT_TABLE_MAIN},
 		)
 		if diff := cmp.Diff(wantRoutes, cfg.NetworkInterfaceConfigInPod.Routes); diff != "" {
 			t.Errorf("routes mismatch (-want +got):\n%s", diff)
+		}
+		if !slices.Contains(cfg.NetworkInterfaceConfigInPod.Rules, slaacRule) {
+			t.Errorf("rules %+v do not include the source rule %+v", cfg.NetworkInterfaceConfigInPod.Rules, slaacRule)
 		}
 		if cfg.NetworkInterfaceStateInPod != nil {
 			t.Errorf("SLAAC left state to release: %+v", cfg.NetworkInterfaceStateInPod)
@@ -544,9 +628,14 @@ func testPrepareResourceClaimSLAAC(t *testing.T) {
 		cfg := prepare(t, claim("slaac-ipvlan", `{"interface":{"type":"IPVLAN","addressing":"SLAAC"}}`))
 		// The child gets no IPv4 address of its parent.
 		checkInterface(t, cfg, "claim-uid-slaac-ipvlan")
-		// A subinterface inherits no host routes, only the advertised ones.
-		if diff := cmp.Diff(slaacTestRoutes(slaacTestRouter), cfg.NetworkInterfaceConfigInPod.Routes); diff != "" {
+		// A subinterface inherits no host routes or rules, only the
+		// advertised routes, in the table of its parent's index.
+		wantRoutes, wantRule := slaacTestSourceRouting(cfg.NetworkInterfaceConfigInPod.Interface.Addresses[0], hostIndex(t))
+		if diff := cmp.Diff(wantRoutes, cfg.NetworkInterfaceConfigInPod.Routes); diff != "" {
 			t.Errorf("routes mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]apis.RuleConfig{wantRule}, cfg.NetworkInterfaceConfigInPod.Rules); diff != "" {
+			t.Errorf("rules mismatch (-want +got):\n%s", diff)
 		}
 	})
 
