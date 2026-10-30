@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -99,6 +100,16 @@ func TestHasInterfaceSysctlConfig(t *testing.T) {
 			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}, VRF: &apis.VRFConfig{Name: "vrf0"}},
 			want:            false,
 		},
+		{
+			name:            "ipv6 address",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24", "2001:db8::1/64"}},
+			want:            true,
+		},
+		{
+			name:            "only ipv4 addresses",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}},
+			want:            false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -159,7 +170,26 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 				Addresses: []string{"192.0.2.1/24", "2001:db8::1/64"},
 				VRF:       &apis.VRFConfig{Name: "vrf0"},
 			},
-			want: map[string]int{"net/ipv6/conf/rdma0/keep_addr_on_down": 1},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/keep_addr_on_down": 1,
+				"net/ipv6/conf/rdma0/disable_ipv6":      0,
+				"net/ipv6/conf/lo/disable_ipv6":         0,
+			},
+		},
+		{
+			// A CNI disabled IPv6 in the Pod namespace, lo included.
+			name:            "an ipv6 address enables ipv6 on the interface and lo",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"2001:db8::1/64"}, AcceptRA: ptr.To[int32](0)},
+			want: map[string]int{
+				"net/ipv6/conf/rdma0/accept_ra":    0,
+				"net/ipv6/conf/rdma0/disable_ipv6": 0,
+				"net/ipv6/conf/lo/disable_ipv6":    0,
+			},
+		},
+		{
+			name:            "only ipv4 addresses leave ipv6 alone",
+			interfaceConfig: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/24"}, ARPIgnore: ptr.To[int32](1)},
+			want:            map[string]int{"net/ipv4/conf/rdma0/arp_ignore": 1},
 		},
 	}
 	for _, tt := range tests {
@@ -172,6 +202,32 @@ func TestApplyInterfaceSysctlsWithSysctl(t *testing.T) {
 				t.Errorf("applyInterfaceSysctlsWithSysctl() settings mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// recordingSysctl records the order of the settings it writes.
+type recordingSysctl struct {
+	*sysctltesting.Fake
+	order []string
+}
+
+func (r *recordingSysctl) SetSysctl(setting string, value int) error {
+	r.order = append(r.order, setting)
+	return r.Fake.SetSysctl(setting, value)
+}
+
+// IPv6 is enabled only once accept_ra has its value, so that the kernel never
+// starts its own autoconfiguration on the interface with the namespace's.
+func TestApplyInterfaceSysctlsWithSysctlIPv6Order(t *testing.T) {
+	sysctls := &recordingSysctl{Fake: sysctltesting.NewFake()}
+	interfaceConfig := apis.InterfaceConfig{Addresses: []string{"2001:db8::1/64"}, AcceptRA: ptr.To[int32](0)}
+	if err := applyInterfaceSysctlsWithSysctl(sysctls, "rdma0", interfaceConfig); err != nil {
+		t.Fatalf("applyInterfaceSysctlsWithSysctl() error: %v", err)
+	}
+	acceptRA := slices.Index(sysctls.order, "net/ipv6/conf/rdma0/accept_ra")
+	enable := slices.Index(sysctls.order, "net/ipv6/conf/rdma0/disable_ipv6")
+	if acceptRA < 0 || enable < 0 || acceptRA > enable {
+		t.Errorf("applyInterfaceSysctlsWithSysctl() wrote %v, want accept_ra before disable_ipv6", sysctls.order)
 	}
 }
 
