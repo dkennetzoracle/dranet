@@ -211,8 +211,9 @@ config:
   discovery timers and DNS options, are ignored.
 * Duplicate address detection runs as the kernel default, so the address is tentative for a
   second or two after the Pod starts. A failed detection is not reported.
-* The interface takes the IPv6 setting of the Pod network namespace. Some CNI plugins disable
-  IPv6 there on an IPv4-only cluster, and the address then fails with `permission denied`.
+* Some CNI plugins disable IPv6 in the Pod network namespace of an IPv4-only cluster. DRANET
+  enables it on the interface, on `lo`, through which the Pod reaches its own addresses, and on
+  the interface's VRF device, and leaves the namespace defaults as they are.
 
 ###### SLAAC routing
 

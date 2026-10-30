@@ -300,14 +300,14 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 		return 0, fmt.Errorf("failed to enslave %s to vrf %s: %w", ifName, vrfName, err)
 	}
 
-	if err := enableVRFSysctls(int(containerNs)); err != nil {
+	if err := enableVRFSysctls(int(containerNs), ifName, vrfName); err != nil {
 		return 0, fmt.Errorf("failed to enable vrf sysctls: %w", err)
 	}
 
 	return int(vrfTable), nil
 }
 
-func enableVRFSysctls(containerNsFd int) error {
+func enableVRFSysctls(containerNsFd int, ifName, vrfName string) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -329,6 +329,16 @@ func enableVRFSysctls(containerNsFd int) error {
 
 	if err := sysctlInterface.SetSysctl("net/ipv4/udp_l3mdev_accept", 1); err != nil {
 		return fmt.Errorf("failed to set udp_l3mdev_accept: %w", err)
+	}
+
+	// The VRF device takes the IPv6 default of the namespace, which some CNI
+	// plugins disable. The kernel delivers traffic to the addresses of the
+	// interface through its VRF device, so an interface with IPv6 enabled,
+	// as SLAAC enables it, needs it on the VRF device too.
+	if disabled, err := sysctlInterface.GetSysctl("net/ipv6/conf/" + ifName + "/disable_ipv6"); err == nil && disabled == 0 {
+		if err := sysctlInterface.SetSysctl("net/ipv6/conf/"+vrfName+"/disable_ipv6", 0); err != nil {
+			return fmt.Errorf("failed to enable IPv6 on vrf %s: %w", vrfName, err)
+		}
 	}
 
 	return nil
