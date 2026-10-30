@@ -202,8 +202,11 @@ func (db *DB) Run(ctx context.Context) error {
 		klog.Error(err, "error subscribing to netlink interfaces, only syncing periodically", "interval", db.maxPollInterval.String())
 	}
 
-	db.gwInterfaces = getExcludedUplinkInterfaces()
-	klog.V(2).Infof("Excluded uplink interfaces and children: %v", db.gwInterfaces.UnsortedList())
+	gwInterfaces := getExcludedUplinkInterfaces()
+	db.mu.Lock()
+	db.gwInterfaces = gwInterfaces
+	db.mu.Unlock()
+	klog.V(2).Infof("Excluded uplink interfaces and children: %v", gwInterfaces.UnsortedList())
 
 	for {
 		err := db.rateLimiter.Wait(ctx)
@@ -259,9 +262,7 @@ func (db *DB) scan() []resourceapi.Device {
 	// Remove default interface.
 	filteredDevices := []hostDevice{}
 	for _, device := range devices {
-		ifName := device.Attributes[apis.AttrInterfaceName].StringValue
-		if ifName != nil && db.gwInterfaces.Has(string(*ifName)) {
-			klog.V(4).Infof("Ignoring interface %s from discovery since it is an uplink interface or a child of one", *ifName)
+		if db.excludedUplink(&device.Device) {
 			continue
 		}
 		filteredDevices = append(filteredDevices, device)
@@ -600,6 +601,45 @@ func (db *DB) getProviderAttributes(device *resourceapi.Device, instance cloudpr
 	}
 
 	return instance.GetDeviceAttributes(id)
+}
+
+// excludedUplink reports whether the device is an uplink of the node, or a
+// child of one, that the inventory does not publish: the cloud provider does not
+// serve it as a subinterface.
+func (db *DB) excludedUplink(device *resourceapi.Device) bool {
+	ifName := device.Attributes[apis.AttrInterfaceName].StringValue
+	if ifName == nil || !db.gwInterfaces.Has(*ifName) {
+		return false
+	}
+	if db.servedAsSubinterface(device) {
+		klog.V(4).Infof("Keeping uplink interface %s: the cloud provider serves it as a subinterface, which leaves it on the host", *ifName)
+		return false
+	}
+	klog.V(4).Infof("Ignoring interface %s from discovery since it is an uplink interface or a child of one", *ifName)
+	return true
+}
+
+// servedAsSubinterface reports whether the cloud provider configures the device
+// as a subinterface. A Pod then gets a child of it and the device stays on the
+// host, so an uplink can be published without a claim taking the node's
+// connectivity; prepare refuses to move it (IsUplinkInterface). On an IPv6 RDMA
+// fabric every rail NIC has a default route from its router, at one metric, so
+// the uplink detection takes all of them for uplinks.
+func (db *DB) servedAsSubinterface(device *resourceapi.Device) bool {
+	if db.instance == nil {
+		return false
+	}
+	config := db.instance.GetDeviceConfig(getDeviceIdentifiers(device))
+	return config != nil && config.Interface.IsSubinterface()
+}
+
+// IsUplinkInterface reports whether ifName is one of the node's uplinks or a
+// child of one. The inventory publishes such an interface only when the cloud
+// provider serves it as a subinterface, and only a subinterface may use it.
+func (db *DB) IsUplinkInterface(ifName string) bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.gwInterfaces.Has(ifName)
 }
 
 func (db *DB) updateDeviceStore(devices []hostDevice) {

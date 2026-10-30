@@ -1094,6 +1094,66 @@ func TestIsIBOnlyDevice(t *testing.T) {
 	})
 }
 
+// deviceConfigProvider returns a device config for each interface name.
+type deviceConfigProvider struct {
+	mockCloudInstance
+	configs map[string]*apis.NetworkConfig
+}
+
+func (p *deviceConfigProvider) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
+	return p.configs[id.Name]
+}
+
+func TestExcludedUplink(t *testing.T) {
+	device := func(ifName string) *resourceapi.Device {
+		return &resourceapi.Device{Name: ifName, Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			apis.AttrInterfaceName: {StringValue: ptr.To(ifName)},
+		}}
+	}
+	provider := &deviceConfigProvider{configs: map[string]*apis.NetworkConfig{
+		// The rail NICs of an IPv6 RDMA fabric, each with a default route from
+		// its router, which the provider serves as IPVLAN children.
+		"rdma0": {Profile: "rdma", Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN}},
+		"rdma1": {Profile: "rdma", Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN}},
+		"eth1":  {Profile: "managed"},
+	}}
+	tests := []struct {
+		name     string
+		instance cloudprovider.CloudInstance
+		device   *resourceapi.Device
+		want     bool
+	}{
+		{name: "uplink without a provider", device: device("rdma0"), want: true},
+		{name: "uplink served as a subinterface", instance: provider, device: device("rdma0"), want: false},
+		{name: "uplink the provider has no config for", instance: provider, device: device("eth0"), want: true},
+		{name: "uplink the provider does not serve as a subinterface", instance: provider, device: device("eth1"), want: true},
+		{name: "not an uplink", instance: provider, device: device("eth2"), want: false},
+		{name: "no interface name", instance: provider, device: &resourceapi.Device{Name: "pci-0000-1d-00-0"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := New(WithCloudInstance(tt.instance))
+			db.gwInterfaces = sets.New[string]("eth0", "eth1", "rdma0", "rdma1")
+			if got := db.excludedUplink(tt.device); got != tt.want {
+				t.Errorf("excludedUplink() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsUplinkInterface(t *testing.T) {
+	db := New()
+	if db.IsUplinkInterface("eth0") {
+		t.Error("IsUplinkInterface() = true before the uplinks are known")
+	}
+	db.gwInterfaces = sets.New[string]("eth0", "rdma0")
+	for ifName, want := range map[string]bool{"eth0": true, "rdma0": true, "eth2": false} {
+		if got := db.IsUplinkInterface(ifName); got != want {
+			t.Errorf("IsUplinkInterface(%q) = %v, want %v", ifName, got, want)
+		}
+	}
+}
+
 func TestGetDeviceReturnsPublishedDevice(t *testing.T) {
 	db := &DB{deviceStore: map[string]hostDevice{"dev": {
 		Device:         resourceapi.Device{Name: "dev"},

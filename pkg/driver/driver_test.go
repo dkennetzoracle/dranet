@@ -50,6 +50,7 @@ type fakeInventoryDB struct {
 	rescanCalls              atomic.Int32
 	GetDeviceFunc            func(deviceName string) (resourcev1.Device, bool)
 	GetDeviceConfigFunc      func(deviceName string) (*apis.NetworkConfig, bool)
+	IsUplinkInterfaceFunc    func(ifName string) bool
 	GetNetInterfaceNameFunc  func(deviceName string) (string, error)
 	IsIBOnlyDeviceFunc       func(deviceName string) bool
 	GetRDMADeviceNameFunc    func(deviceName string) (string, error)
@@ -104,6 +105,13 @@ func (m *fakeInventoryDB) GetDeviceConfig(deviceName string) (*apis.NetworkConfi
 		return m.GetDeviceConfigFunc(deviceName)
 	}
 	return nil, false
+}
+
+func (m *fakeInventoryDB) IsUplinkInterface(ifName string) bool {
+	if m.IsUplinkInterfaceFunc != nil {
+		return m.IsUplinkInterfaceFunc(ifName)
+	}
+	return false
 }
 
 func (m *fakeInventoryDB) RequestRescan() {

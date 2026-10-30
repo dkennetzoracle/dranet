@@ -67,6 +67,7 @@ type inventoryDB interface {
 	IsIBOnlyDevice(deviceName string) bool
 	GetRDMADeviceName(deviceName string) (string, error)
 	GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool)
+	IsUplinkInterface(ifName string) bool
 	RequestRescan()
 	GetProfileConfig(deviceName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
 	ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error

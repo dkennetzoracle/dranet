@@ -1965,3 +1965,54 @@ func TestClearStaleRouteSources(t *testing.T) {
 		})
 	}
 }
+
+// The inventory publishes an uplink when the cloud provider serves it as a
+// subinterface; a claim that would move it into the Pod instead fails.
+func TestPrepareResourceClaimRefusesToMoveAnUplink(t *testing.T) {
+	claim := func(config string) *resourcev1.ResourceClaim {
+		c := &resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-uplink", Namespace: "default", Name: "uplink"},
+			Status: resourcev1.ResourceClaimStatus{
+				ReservedFor: []resourcev1.ResourceClaimConsumerReference{{Resource: "pods", Name: "pod", UID: "pod-uid-uplink"}},
+				Allocation: &resourcev1.AllocationResult{Devices: resourcev1.DeviceAllocationResult{
+					Results: []resourcev1.DeviceRequestAllocationResult{{Driver: "test.driver", Device: "rdma0", Request: "req"}},
+				}},
+			},
+		}
+		if config != "" {
+			c.Status.Allocation.Devices.Config = []resourcev1.DeviceAllocationConfiguration{{
+				Source: resourcev1.AllocationConfigSourceClaim,
+				DeviceConfiguration: resourcev1.DeviceConfiguration{Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver: "test.driver", Parameters: runtime.RawExtension{Raw: []byte(config)},
+				}},
+			}}
+		}
+		return c
+	}
+	tests := []struct {
+		name    string
+		uplink  bool
+		config  string
+		wantErr bool
+	}{
+		{name: "uplink moved into the Pod", uplink: true, config: `{"interface":{"type":"Passthrough"}}`, wantErr: true},
+		{name: "uplink without a type", uplink: true, wantErr: true},
+		{name: "uplink as the parent of a subinterface", uplink: true, config: `{"interface":{"type":"IPVLAN"}}`},
+		{name: "other interface moved into the Pod", config: `{"interface":{"type":"Passthrough"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeDB := newFakeInventoryDB()
+			fakeDB.GetNetInterfaceNameFunc = func(string) (string, error) { return "rdma0", nil }
+			fakeDB.IsUplinkInterfaceFunc = func(ifName string) bool { return tt.uplink && ifName == "rdma0" }
+			np := &NetworkDriver{netdb: fakeDB, driverName: "test.driver", podConfigStore: mustNewPodConfigStore(), eventRecorder: record.NewFakeRecorder(10)}
+			err := np.prepareResourceClaim(context.Background(), claim(tt.config)).Err
+			// Past the check, prepare reads the host interface, which the test
+			// does not create; only the uplink refusal matters here.
+			refused := err != nil && strings.Contains(err.Error(), "is an uplink of the node")
+			if refused != tt.wantErr {
+				t.Errorf("prepareResourceClaim() error = %v, want the uplink refusal: %v", err, tt.wantErr)
+			}
+		})
+	}
+}

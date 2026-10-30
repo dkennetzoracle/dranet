@@ -332,6 +332,11 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 	if err != nil {
 		return fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err)
 	}
+	// The inventory publishes an uplink only when the cloud provider serves it
+	// as a subinterface, and the claim's config wins over the provider's.
+	if np.netdb.IsUplinkInterface(ifName) && !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
+		return fmt.Errorf("interface %s of device %s is an uplink of the node, or a child of one, and can only be the parent of a subinterface; set interface.type: %s", ifName, result.Device, apis.InterfaceTypeIPVLAN)
+	}
 	// Get Network configuration and merge it
 	link, err := nlHandle.LinkByName(ifName)
 	if err != nil {
