@@ -505,6 +505,10 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim
 	if _, ok := railVFIndex(ifName); ok {
 		return nil, fmt.Errorf("%s is the VF of a multi-planar rail, which the OKE profile supports on an IPv6 RDMA fabric only, and this fabric is IPv4", ifName)
 	}
+	// OCA addresses an IPv4 fabric; no router advertises there.
+	if config.Interface.Addressing == apis.AddressingModeSLAAC {
+		return nil, fmt.Errorf("the OKE profile supports SLAAC addressing on an IPv6 RDMA fabric only, and this fabric is IPv4; remove interface.addressing for %s", ifName)
+	}
 	// The sysctl reads are cheap and can reject the request before any
 	// address read, which costs a netlink dump.
 	arpIgnore, arpAnnounce, err := parentARPPolicy(ifName, config.Interface.ARPIgnore, config.Interface.ARPAnnounce)
@@ -625,9 +629,6 @@ func validateOKEProfileRequest(iface *apis.InterfaceConfig) error {
 	}
 	if iface.Addressing == apis.AddressingModeDHCP {
 		return errors.New("the OKE profile does not support DHCP addressing")
-	}
-	if iface.Addressing == apis.AddressingModeSLAAC {
-		return errors.New("the OKE profile does not support SLAAC addressing")
 	}
 	if iface.Addressing == apis.AddressingModeUnnumbered {
 		return errors.New("the OKE profile does not support unnumbered addressing")

@@ -27,7 +27,7 @@ The profile needs these conditions:
 - The child range is large enough for the primary VNIC subnet. See [The child range](#the-child-range).
 - No VCN subnet, pod CIDR, or service CIDR uses the child range. For each claim, the provider checks the OCA RDMA network, every VNIC subnet of the node, every host route that overlaps the child range except the default route, and the Kubernetes service address. It cannot see the whole pod CIDR or service CIDR.
 
-The profile rejects `interface.type: Passthrough`, DHCP, SLAAC and unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
+The profile rejects `interface.type: Passthrough`, DHCP and unnumbered addressing, SLAAC addressing on an IPv4 fabric, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
 A PCI function that carries several netdevs, one of them with an RDMA name, stays on the host on every fabric, and a claim for it fails. Such a function is, for example, the PF of a multi-planar rail with its plane netdevs, or a PF in switchdev mode with its VF representors. Claim a netdev with a PCI function of its own, such as a VF. The rail VFs of a multi-planar shape, `rdma_vf_rail<N>`, get the profile on an IPv6 fabric only: on an IPv4 fabric a claim for one fails. These refusals need `--profile-provider=cloud`, like the profile. With `none`, a claim for such a PCI function moves it into the pod.
 
@@ -43,6 +43,8 @@ On an IPv6 fabric (`oke.dra.net/rdmaFabricIpv6` is true) the rail routers advert
 - `acceptRA: 0`: the child ignores the router's advertisements, so the pod autoconfigures nothing next to that address. A claim that sets another `acceptRA` fails;
 - a route table with a link route for the `/64` and the default route through the router of the RDMA NIC's IPv6 default route, and a source rule from the child address to that table. The table is 100 plus the index for `rdmaN` and 116 plus the index for `rdma_vf_rail<N>`.
 
+A claim with `addressing: SLAAC` gets the IPvlan child only from the profile. DRANET solicits the rail router on the RDMA NIC itself and gives the child an address in the advertised `/64`, and the routes of the advertisement in a table of its own with a source rule from the address (see [SLAAC addressing](../interface-configuration/#slaac-addressing)). It does not depend on the host's autoconfiguration of the RDMA NIC, and it enables IPv6 on the child, which the OCI VCN-Native CNI disables on an IPv4-only cluster.
+
 On an IPv6 fabric a claim with its own `routes` or `rules` owns the routing, but `interface.vrf` fails the claim: joining a VRF cycles the child, which then loses its static IPv6 address until the driver keeps it ([#390](https://github.com/kubernetes-sigs/dranet/pull/390)), and the per-rail tables already keep the rails apart.
 
 The provider reads the `/64` and the router from the host, where the RDMA NIC's default route may sit in the table of a VRF. An address that is deprecated, tentative, or failed duplicate address detection does not count, so the old prefix of a renumbered fabric is ignored while it expires. Until the host has a usable address and a default route, prepare fails and Kubernetes retries it; a claim with its own `routes` or `rules` needs only the address. An RDMA NIC with usable addresses in more than one `/64` fails the claim. With several default routes the lowest metric wins, then the lowest router address; the router preference of the advertisement is not read. A default route through a nexthop object, as routing daemons such as FRR install, is not read. When the RDMA NIC has no default route the provider can read and the host has such routes, the error names both possible causes: no advertisement yet, or a route through a nexthop object. Kernel RA routes do not use nexthop objects.
@@ -53,7 +55,7 @@ On a multi-planar shape the PF of each rail shares its PCI function with the pla
 
 Every RDMA NIC's default route is `::/0`, which is why each one gets its own table: RoCE resolves a GID's peers with the GID's address as the source, which the rule sends to the table of its own RDMA NIC. Other traffic must use the child address as its source, as on an IPv4 fabric; a socket bound only to the interface finds no route. For NCCL set `NCCL_IB_ADDR_FAMILY=AF_INET6` and leave `NCCL_IB_GID_INDEX` unset: NCCL then selects the child's RoCE v2 GID. The address goes through duplicate address detection when the pod starts, so an application that binds to it within about a second can get `EADDRNOTAVAIL`.
 
-The pod network namespace must have IPv6 enabled. A CNI that disables IPv6 there, as the OCI VCN-Native CNI does on an IPv4-only cluster, makes the address fail. The child range and the OCA files do not apply on an IPv6 fabric.
+Without `addressing: SLAAC` the pod network namespace must have IPv6 enabled. A CNI that disables IPv6 there, as the OCI VCN-Native CNI does on an IPv4-only cluster, makes the static address fail; use `addressing: SLAAC` on such a cluster. The child range and the OCA files do not apply on an IPv6 fabric.
 
 ## The child range
 
