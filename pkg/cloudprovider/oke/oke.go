@@ -1133,6 +1133,16 @@ func (o *OKEInstance) isRDMANic(ifName string) bool {
 	return err == nil && addressIn(addresses, o.ocaConfig.parentIPv4Range).IsValid()
 }
 
+// IsNeverUplink reports whether ifName is an Ethernet RDMA NIC or rail VF. They
+// carry the RDMA fabric, never the node's VCN traffic, but on an IPv6 fabric
+// the rail routers advertise a default route on each of them, which would make
+// the inventory exclude every one as an uplink on a node without an IPv6
+// default route of lower metric on its primary VNIC, as on an IPv4-only
+// cluster.
+func (o *OKEInstance) IsNeverUplink(ifName string) bool {
+	return o.isRDMANic(ifName) || isEthernetRailVF(ifName)
+}
+
 // rdmaNicIndex returns the RDMA NIC index encoded in an rdmaN name. OCA
 // assigns the name and the RDMA NIC address from the same table entry.
 func rdmaNicIndex(ifName string) (int, bool) {

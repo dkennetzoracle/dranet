@@ -1496,6 +1496,45 @@ func TestHasRDMANic(t *testing.T) {
 	})
 }
 
+func TestIsNeverUplink(t *testing.T) {
+	t.Run("named RDMA NICs and rail VFs", func(t *testing.T) {
+		fakeSysfs(t)
+		instance := newOKEInstance(nil, nil)
+		instance.addressFallback = false
+		fakeInterface(t, "eth0", "", unix.ARPHRD_ETHER)
+		fakeInterfaceAddresses(t, "eth0", "10.140.77.19/19")
+		fakeInterface(t, "rdma3", "", unix.ARPHRD_INFINIBAND)
+		fakeInterface(t, "rdma4", "", unix.ARPHRD_ETHER)
+		fakeInterface(t, "rdma_vf_rail2", "", unix.ARPHRD_ETHER)
+		for ifName, want := range map[string]bool{
+			"eth0":          false,
+			"rdma3":         false,
+			"rdma4":         true,
+			"rdma_vf_rail2": true,
+			"missing0":      false,
+		} {
+			if got := instance.IsNeverUplink(ifName); got != want {
+				t.Errorf("IsNeverUplink(%q) = %v, want %v", ifName, got, want)
+			}
+		}
+	})
+
+	t.Run("unnamed RDMA NIC with an OCA address", func(t *testing.T) {
+		fakeSysfs(t)
+		instance := newOKEInstance(nil, nil)
+		fakeInterface(t, "ens300f0", "", unix.ARPHRD_ETHER)
+		fakeInterfaceAddresses(t, "ens300f0", "10.140.77.19/19")
+		fakeInterface(t, "ens3f0", "", unix.ARPHRD_ETHER)
+		fakeInterfaceAddresses(t, "ens3f0", "10.224.13.19/12")
+		if instance.IsNeverUplink("ens300f0") {
+			t.Error("IsNeverUplink() = true for the VCN interface")
+		}
+		if !instance.IsNeverUplink("ens3f0") {
+			t.Error("IsNeverUplink() = false for an Ethernet interface in the OCA network")
+		}
+	})
+}
+
 func TestRDMANicIndex(t *testing.T) {
 	tests := []struct {
 		ifName    string
