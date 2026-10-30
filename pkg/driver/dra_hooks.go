@@ -417,7 +417,9 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			addresses = addresses[:room]
 		}
 		podIface.Addresses = append(podIface.Addresses, addresses...)
+		routes, rules := slaacSourceRouting(addresses, routes, link.Attrs().Index, podIface.VRF != nil)
 		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+		deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, rules...)
 	default:
 		// For a passthrough interface with no custom addresses, use the
 		// existing ones.

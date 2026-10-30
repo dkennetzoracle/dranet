@@ -115,6 +115,45 @@ func getSLAAC(ctx context.Context, ifName string, id slaac.InterfaceIdentifier) 
 	return addresses, routes, nil
 }
 
+// slaacSourceRouting puts the routes of a SLAAC interface in a table of its own,
+// apis.SLAACRouteTableOffset plus hostIndex, the index of its host interface,
+// with a link route for each prefix it has an address in, and a rule that sends
+// the traffic from each of its addresses to that table. The main table keeps
+// only the link routes the kernel adds with the addresses. Each router of a
+// Pod's interfaces advertises a default route, and the main table holds one per
+// metric, so a second SLAAC interface, or the CNI's IPv6 default route in a
+// dual-stack cluster, would keep the others from theirs. RoCE resolves the
+// peers of a GID with the GID's address as the source, so the rule also sends
+// that to the interface's own router. In a VRF the driver puts all the routes
+// in the VRF's table, which needs no rule, so they are returned as they are.
+func slaacSourceRouting(addresses []string, routes []apis.RouteConfig, hostIndex int, inVRF bool) ([]apis.RouteConfig, []apis.RuleConfig) {
+	if inVRF {
+		return routes, nil
+	}
+	table := apis.SLAACRouteTableOffset + hostIndex
+	var tableRoutes []apis.RouteConfig
+	var rules []apis.RuleConfig
+	for _, address := range addresses {
+		prefix, err := netip.ParsePrefix(address)
+		if err != nil || !prefix.Addr().Is6() {
+			continue
+		}
+		if prefix.Bits() < prefix.Addr().BitLen() {
+			tableRoutes = append(tableRoutes, apis.RouteConfig{Destination: prefix.Masked().String(), Scope: unix.RT_SCOPE_LINK, Table: table})
+		}
+		rules = append(rules, apis.RuleConfig{
+			Priority: apis.SourceRoutingRulePriority,
+			Source:   netip.PrefixFrom(prefix.Addr(), prefix.Addr().BitLen()).String(),
+			Table:    table,
+		})
+	}
+	for _, route := range routes {
+		route.Table = table
+		tableRoutes = append(tableRoutes, route)
+	}
+	return tableRoutes, rules
+}
+
 // waitForCarrier waits until the link ifName, just set up, has its carrier,
 // as a NIC may take seconds to. A link whose driver reports no operational
 // state is taken as ready.

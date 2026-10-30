@@ -939,11 +939,16 @@ EOF
   assert_output "0"
 
   # The default route and the more specific route go through the router's
-  # link-local address.
-  run kubectl exec pod-slaac -- ip -6 route show dev eth99
+  # link-local address, in the interface's own table, and a rule sends the
+  # traffic from the address there.
+  run kubectl exec pod-slaac -- ip -6 route show table all dev eth99
   assert_success
-  assert_output --regexp "default via fe80::[0-9a-f:]+"
-  assert_output --regexp "2001:db8:5aac:1::/64 via fe80::[0-9a-f:]+"
+  assert_output --regexp "default via fe80::[0-9a-f:]+ table [0-9]+"
+  assert_output --regexp "2001:db8:5aac:1::/64 via fe80::[0-9a-f:]+ table [0-9]+"
+  run kubectl exec pod-slaac -- ip -6 route show dev eth99
+  refute_output --partial "default"
+  run kubectl exec pod-slaac -- ip -6 rule show
+  assert_output --regexp "from ${ADDRESS%/*} lookup [0-9]+"
 
   # The first solicitation was dropped, and a retransmission was answered.
   run docker exec "$NODE_NAME" bash -c "ip6tables -w -L INPUT -v -n -x | awk '/slaac-rtr/ && /statistic/ {print \$1}'"
