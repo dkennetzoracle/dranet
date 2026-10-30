@@ -197,8 +197,9 @@ func isEthernetRailVF(ifName string) bool {
 // prefix or the rail router changes, the child keeps the old ones until the pod
 // is recreated.
 //
-// The pod namespace must have IPv6 enabled: a CNI that disables it there, as
-// the OCI VCN-Native CNI does on an IPv4-only cluster, makes the address fail.
+// A CNI that disables IPv6 in the pod namespace, as the OCI VCN-Native CNI does
+// on an IPv4-only cluster, does not affect the child: the driver enables IPv6 on
+// an interface that gets an IPv6 address.
 func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.ResourceClaim, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	index, tableBase := 0, okeRDMASBRTableBase
 	if i, ok := rdmaNicIndex(ifName); ok {

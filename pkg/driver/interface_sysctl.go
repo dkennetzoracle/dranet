@@ -37,7 +37,15 @@ var sysctlProvider = sysctl.New
 // hasInterfaceSysctlConfig reports whether the interface config asks for any per-interface sysctl.
 func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
 	return interfaceConfig.ARPIgnore != nil || interfaceConfig.ARPAnnounce != nil || interfaceConfig.AcceptRA != nil ||
-		keepsIPv6AddressesInVRF(interfaceConfig)
+		hasIPv6Address(interfaceConfig)
+}
+
+// hasIPv6Address reports whether the interface gets an IPv6 address.
+func hasIPv6Address(interfaceConfig apis.InterfaceConfig) bool {
+	return slices.ContainsFunc(interfaceConfig.Addresses, func(address string) bool {
+		prefix, err := netip.ParsePrefix(address)
+		return err == nil && prefix.Addr().Is6()
+	})
 }
 
 // keepsIPv6AddressesInVRF reports whether the interface joins a VRF with IPv6
@@ -45,10 +53,7 @@ func hasInterfaceSysctlConfig(interfaceConfig apis.InterfaceConfig) bool {
 // added, and the kernel then removes its IPv6 addresses unless it keeps them on
 // down.
 func keepsIPv6AddressesInVRF(interfaceConfig apis.InterfaceConfig) bool {
-	return interfaceConfig.VRF != nil && slices.ContainsFunc(interfaceConfig.Addresses, func(address string) bool {
-		prefix, err := netip.ParsePrefix(address)
-		return err == nil && prefix.Addr().Is6()
-	})
+	return interfaceConfig.VRF != nil && hasIPv6Address(interfaceConfig)
 }
 
 func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName string, interfaceConfig apis.InterfaceConfig) error {
@@ -83,6 +88,19 @@ func applyInterfaceSysctlsWithSysctl(sysctlInterface sysctl.Interface, ifName st
 	}
 	if keepsIPv6AddressesInVRF(interfaceConfig) {
 		set("ipv6", "keep_addr_on_down", 1)
+	}
+	// An interface takes the IPv6 default of the namespace it moves into or is
+	// created in, and some CNI plugins disable IPv6 in the Pod namespace of an
+	// IPv4-only cluster, lo included; the OCI VCN-Native CNI does. Adding an
+	// IPv6 address then fails with EACCES, so enable IPv6 on an interface that
+	// gets one, and on lo, through which the Pod reaches its own addresses. The
+	// namespace defaults stay as the CNI set them. Last, after accept_ra, so
+	// that enabling IPv6 does not autoconfigure with the namespace's accept_ra.
+	if hasIPv6Address(interfaceConfig) {
+		set("ipv6", "disable_ipv6", 0)
+		if err := sysctlInterface.SetSysctl("net/ipv6/conf/lo/disable_ipv6", 0); err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to set net/ipv6/conf/lo/disable_ipv6: %w", err))
+		}
 	}
 	return errors.Join(errorList...)
 }

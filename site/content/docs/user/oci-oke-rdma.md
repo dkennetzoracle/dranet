@@ -53,7 +53,7 @@ On a multi-planar shape the PF of each rail shares its PCI function with the pla
 
 Every RDMA NIC's default route is `::/0`, which is why each one gets its own table: RoCE resolves a GID's peers with the GID's address as the source, which the rule sends to the table of its own RDMA NIC. Other traffic must use the child address as its source, as on an IPv4 fabric; a socket bound only to the interface finds no route. For NCCL set `NCCL_IB_ADDR_FAMILY=AF_INET6` and leave `NCCL_IB_GID_INDEX` unset: NCCL then selects the child's RoCE v2 GID. The address goes through duplicate address detection when the pod starts, so an application that binds to it within about a second can get `EADDRNOTAVAIL`.
 
-The pod network namespace must have IPv6 enabled. A CNI that disables IPv6 there, as the OCI VCN-Native CNI does on an IPv4-only cluster, makes the address fail. The child range and the OCA files do not apply on an IPv6 fabric.
+A CNI that disables IPv6 in the pod network namespace, as the OCI VCN-Native CNI does on an IPv4-only cluster, does not affect the child: DRANET enables IPv6 on the child and on `lo`, and leaves the namespace defaults as the CNI set them. The child range and the OCA files do not apply on an IPv6 fabric.
 
 ## The child range
 
