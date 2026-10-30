@@ -517,6 +517,54 @@ func TestIPv6ProfileConfig(t *testing.T) {
 // claim's config and validates the result before applying it, so the profile's
 // output must pass that validation: with the claim setting nothing, only the
 // interface, or routing of its own.
+// With SLAAC the driver gives the child its address and routes, so the profile
+// makes only the child and reads nothing from the host: the parent here has no
+// address and no default route.
+func TestIPv6ProfileConfigSLAAC(t *testing.T) {
+	ipv6Fabric := &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true, Planes: 4}}
+	tests := []struct {
+		name    string
+		iface   apis.InterfaceConfig
+		wantErr string
+	}{
+		{name: "the child only", iface: apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC}},
+		{
+			name:    "claim acceptRA 2 is rejected",
+			iface:   apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC, AcceptRA: ptr.To[int32](2)},
+			wantErr: "needs acceptRA 0",
+		},
+		{
+			name:    "user VRF is rejected",
+			iface:   apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC, VRF: &apis.VRFConfig{Name: "vrf_r3"}},
+			wantErr: "does not support interface.vrf",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeSysfs(t)
+			fakeInterface(t, "rdma_vf_rail3", "0000:11:00.4", unix.ARPHRD_ETHER)
+			fakeIPv6Addresses(t, "rdma_vf_rail3")
+			fakeIPv6Routers(t, map[string][]ipv6Router{}, 0)
+			instance := newOKEInstance(ipv6Fabric, nil)
+			id := cloudprovider.DeviceIdentifiers{Name: "rdma_vf_rail3", PCIAddress: "0000:11:00.4"}
+			got, err := instance.GetProfileConfig(id, testClaim("3f1c9b52-1d4e-4c84-9a3e-0d4d1f0c7a11"), &apis.NetworkConfig{Profile: okeRDMAProfile, Interface: tt.iface})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("GetProfileConfig() error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetProfileConfig() returned error: %v", err)
+			}
+			want := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN, AcceptRA: ptr.To[int32](0)}}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("GetProfileConfig() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestIPv6ProfileConfigMergesIntoValidConfig(t *testing.T) {
 	ipv6Fabric := &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true, Planes: 4}}
 	tests := []struct {
@@ -539,6 +587,11 @@ func TestIPv6ProfileConfigMergesIntoValidConfig(t *testing.T) {
 				Routes:    []apis.RouteConfig{{Destination: "::/0", Gateway: testRailRouter}},
 			},
 			wantRoutes: 1,
+		},
+		{
+			// The driver adds the routes and the rule after the SLAAC exchange.
+			name:  "claim asks for SLAAC",
+			claim: &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC}},
 		},
 	}
 	for _, tt := range tests {

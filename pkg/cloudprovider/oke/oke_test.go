@@ -788,11 +788,11 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr:  "does not support DHCP",
 		},
 		{
-			name:     "slaac addressing is rejected",
+			name:     "slaac addressing is rejected on an IPv4 fabric",
 			config:   profileConfig(apis.InterfaceConfig{Addressing: apis.AddressingModeSLAAC}),
 			metadata: ipv4Fabric(),
 			ifName:   "rdma0",
-			wantErr:  "does not support SLAAC",
+			wantErr:  "SLAAC addressing on an IPv6 RDMA fabric only",
 		},
 		{
 			name:     "unnumbered addressing is rejected",

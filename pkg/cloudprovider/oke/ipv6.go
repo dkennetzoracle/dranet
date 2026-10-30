@@ -230,6 +230,15 @@ func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.Resour
 		return nil, fmt.Errorf("the OKE profile on an IPv6 fabric routes the %s child with a table of its own and does not support interface.vrf, whose IPv6 addresses would not survive joining it", ifName)
 	}
 
+	// With SLAAC the driver solicits the rail router itself and gives the
+	// child its address, and its routes in a table of its own with a rule from
+	// the address, so the profile only makes the child.
+	if config.Interface.Addressing == apis.AddressingModeSLAAC {
+		return &apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN, AcceptRA: ptr.To[int32](0)},
+		}, nil
+	}
+
 	prefix, parentAddrs, err := parentIPv6Prefix(ifName)
 	if err != nil {
 		return nil, err

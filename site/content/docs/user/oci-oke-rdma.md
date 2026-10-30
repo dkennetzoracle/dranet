@@ -27,7 +27,7 @@ The profile needs these conditions:
 - The child range is large enough for the primary VNIC subnet. See [The child range](#the-child-range).
 - No VCN subnet, pod CIDR, or service CIDR uses the child range. For each claim, the provider checks the OCA RDMA network, every VNIC subnet of the node, every host route that overlaps the child range except the default route, and the Kubernetes service address. It cannot see the whole pod CIDR or service CIDR.
 
-The profile rejects `interface.type: Passthrough`, DHCP, SLAAC and unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
+The profile rejects `interface.type: Passthrough`, DHCP and unnumbered addressing, SLAAC addressing on an IPv4 fabric, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
 A PCI function that carries several netdevs, one of them with an RDMA name, stays on the host on every fabric, and a claim for it fails. Such a function is, for example, the PF of a multi-planar rail with its plane netdevs, or a PF in switchdev mode with its VF representors. Claim a netdev with a PCI function of its own, such as a VF. The rail VFs of a multi-planar shape, `rdma_vf_rail<N>`, get the profile on an IPv6 fabric only: on an IPv4 fabric a claim for one fails. These refusals need `--profile-provider=cloud`, like the profile. With `none`, a claim for such a PCI function moves it into the pod.
 
@@ -42,6 +42,8 @@ On an IPv6 fabric (`oke.dra.net/rdmaFabricIpv6` is true) the rail routers advert
 - one address in the `/64` of the RDMA NIC. The interface identifier is a hash of the claim UID and the RDMA NIC name: a repeated prepare of the claim gets the same address, and the next claim on the RDMA NIC a new one, so it does not clash with a child of the previous claim that is still being torn down;
 - `acceptRA: 0`: the child ignores the router's advertisements, so the pod autoconfigures nothing next to that address. A claim that sets another `acceptRA` fails;
 - a route table with a link route for the `/64` and the default route through the router of the RDMA NIC's IPv6 default route, and a source rule from the child address to that table. The table is 100 plus the index for `rdmaN` and 116 plus the index for `rdma_vf_rail<N>`.
+
+A claim with `addressing: SLAAC` gets the IPvlan child only from the profile. DRANET solicits the rail router on the RDMA NIC itself and gives the child an address in the advertised `/64`, and the routes of the advertisement in a table of its own with a source rule from the address (see [SLAAC addressing](../interface-configuration/#slaac-addressing)). It does not depend on the host's autoconfiguration of the RDMA NIC.
 
 On an IPv6 fabric a claim with its own `routes` or `rules` owns the routing, but `interface.vrf` fails the claim: joining a VRF cycles the child, which then loses its static IPv6 address until the driver keeps it ([#390](https://github.com/kubernetes-sigs/dranet/pull/390)), and the per-rail tables already keep the rails apart.
 
